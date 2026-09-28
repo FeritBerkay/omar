@@ -57,6 +57,8 @@ const SESSION_DELIVERY_VAR: &str = "OMAR_DELIVERY";
 #[derive(Debug, Clone)]
 pub struct TmuxClient {
     prefix: String,
+    server: Option<Option<String>>,
+    socket: Option<String>,
 }
 
 /// An agent name as tmux will store it.
@@ -76,12 +78,22 @@ thread_local! {
 }
 
 pub fn tmux_command() -> Command {
+    let mut command = tmux_command_for_server(std::env::var("OMAR_TMUX_SERVER").ok().as_deref());
+    // Ordinary interactive operations retain the caller's tmux context.
+    if let Some(tmux) = std::env::var_os("TMUX") {
+        command.env("TMUX", tmux);
+    }
+    command
+}
+
+fn tmux_command_for_server(server: Option<&str>) -> Command {
     #[cfg(test)]
     if let Some(path) = TEST_TMUX.with(|path| path.borrow().clone()) {
         return Command::new(path);
     }
     let mut cmd = Command::new("tmux");
-    if let Ok(server) = std::env::var("OMAR_TMUX_SERVER") {
+    cmd.env_remove("TMUX");
+    if let Some(server) = server {
         let server = server.trim();
         if !server.is_empty() {
             cmd.args(["-L", server]);
@@ -132,6 +144,37 @@ impl TmuxClient {
     pub fn new(prefix: impl Into<String>) -> Self {
         Self {
             prefix: prefix.into(),
+            server: None,
+            socket: None,
+        }
+    }
+
+    /// Pin commands to a recorded server; None explicitly means the default server.
+    pub fn on_server(prefix: impl Into<String>, server: Option<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
+            server: Some(server),
+            socket: None,
+        }
+    }
+
+    pub fn on_socket(socket: String) -> Self {
+        Self {
+            prefix: String::new(),
+            server: Some(None),
+            socket: Some(socket),
+        }
+    }
+
+    fn command(&self) -> Command {
+        if let Some(socket) = &self.socket {
+            let mut command = tmux_command_for_server(None);
+            command.args(["-S", socket]);
+            return command;
+        }
+        match &self.server {
+            Some(server) => tmux_command_for_server(server.as_deref()),
+            None => tmux_command(),
         }
     }
 
@@ -145,7 +188,8 @@ impl TmuxClient {
     }
 
     fn run(&self, args: &[&str]) -> Result<String> {
-        let output = tmux_command()
+        let output = self
+            .command()
             .args(args)
             .output()
             .context("Failed to execute tmux - is tmux installed?")?;
@@ -484,6 +528,17 @@ impl TmuxClient {
         workdir: Option<&str>,
         backend: Option<&str>,
     ) -> Result<()> {
+        self.new_session_with_backend_env(name, command, workdir, backend, &[])
+    }
+
+    pub(crate) fn new_session_with_backend_env(
+        &self,
+        name: &str,
+        command: &str,
+        workdir: Option<&str>,
+        backend: Option<&str>,
+        environment: &[(String, String)],
+    ) -> Result<()> {
         let (cols, rows) = agent_dimensions(crossterm::terminal::size().ok());
         let cols = cols.to_string();
         let rows = rows.to_string();
@@ -508,6 +563,7 @@ impl TmuxClient {
         let env: Vec<String> = setup
             .env
             .iter()
+            .chain(environment)
             .map(|(key, value)| format!("{key}={value}"))
             .collect();
         for value in &env {
@@ -628,28 +684,49 @@ impl TmuxClient {
     /// Stop the assistant and its sidecars, including background children
     /// which may ignore the terminal hangup sent by `kill-session` alone.
     pub fn kill_session_tree(&self, name: &str) -> Result<()> {
-        if !self.has_session(name)? {
-            return Ok(());
-        }
+        self.has_session_for_cleanup(name)?;
         let tree = crate::process::process_tree(self.get_pane_pid(name)?);
+        // Capture ownership before closing tmux. Always signal the captured
+        // descendants, including when kill-session itself fails.
+        let teardown = self.kill_session(name);
         crate::process::signal_tree(&tree, "-TERM");
-        if self.has_session(name)? {
-            self.kill_session(name)?;
-        }
         thread::sleep(Duration::from_millis(500));
         crate::process::signal_tree(&tree, "-KILL");
-        Ok(())
+        teardown
     }
 
     /// Check if a session exists
     pub fn has_session(&self, name: &str) -> Result<bool> {
+        self.check_session(name, false)
+    }
+
+    pub fn has_session_for_cleanup(&self, name: &str) -> Result<bool> {
+        self.check_session(name, true)
+    }
+
+    fn check_session(&self, name: &str, require_server: bool) -> Result<bool> {
         let target = exact_session_target(name);
-        let result = tmux_command()
+        let result = self
+            .command()
             .args(["has-session", "-t", &target])
             .output()
             .context("Failed to execute tmux")?;
 
-        Ok(result.status.success())
+        if result.status.success() {
+            return Ok(true);
+        }
+        let error = String::from_utf8_lossy(&result.stderr);
+        if !require_server
+            && (error.contains("can't find session")
+                || error.contains("no server running")
+                || error.contains("no sessions")
+                || (error.contains("error connecting to")
+                    && (error.contains("No such file or directory")
+                        || error.contains("Connection refused"))))
+        {
+            return Ok(false);
+        }
+        anyhow::bail!("tmux session state is unknown: {}", error.trim())
     }
 
     /// Return true when a tmux session exists and has at least one live pane.
@@ -659,7 +736,8 @@ impl TmuxClient {
     /// but the session cannot accept input or be attached as a running agent.
     pub fn session_has_live_pane(&self, name: &str) -> Result<bool> {
         let target = exact_session_target(name);
-        let result = tmux_command()
+        let result = self
+            .command()
             .args(["list-panes", "-t", &target, "-F", "#{pane_dead}"])
             .output()
             .context("Failed to execute tmux")?;
@@ -712,7 +790,7 @@ impl TmuxClient {
     /// Attach to a session (blocks until detached)
     pub fn attach_session(&self, session: &str) -> Result<()> {
         let target = exact_session_target(session);
-        tmux_command()
+        self.command()
             .args(["attach-session", "-t", &target])
             .status()
             .context("Failed to attach to tmux session")?;
@@ -723,7 +801,8 @@ impl TmuxClient {
     pub fn attach_popup(&self, session: &str, width: &str, height: &str) -> Result<()> {
         let target = exact_session_target(session);
         let command = popup_attach_command(&target);
-        let status = tmux_command()
+        let status = self
+            .command()
             .args(["display-popup", "-E", "-w", width, "-h", height, &command])
             .status()
             .context("Failed to open tmux popup")?;
@@ -737,6 +816,54 @@ impl TmuxClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_requires_reachable_server_and_propagates_unexpected_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("tmux");
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_TMUX.with(|p| *p.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        TEST_TMUX.with(|p| *p.borrow_mut() = Some(script.clone()));
+        let client = TmuxClient::new("");
+        for (message, ordinary_missing, cleanup_missing) in [
+            ("can't find session: example", true, false),
+            ("no server running on /tmp/test", true, false),
+            (
+                "error connecting to /tmp/test (No such file or directory)",
+                true,
+                false,
+            ),
+            (
+                "error connecting to /tmp/test (Permission denied)",
+                false,
+                false,
+            ),
+            ("unexpected failure", false, false),
+        ] {
+            std::fs::write(
+                &script,
+                format!("#!/bin/sh\nprintf '%s\\n' \"{message}\" >&2\nexit 1\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                client.has_session("example").is_ok(),
+                ordinary_missing,
+                "{message}"
+            );
+            assert_eq!(
+                client.has_session_for_cleanup("example").is_ok(),
+                cleanup_missing,
+                "{message}"
+            );
+        }
+    }
 
     #[test]
     fn launch_geometry_uses_the_terminal_or_a_bounded_headless_fallback() {

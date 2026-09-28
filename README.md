@@ -33,6 +33,7 @@ Terminal UI
 - **Full control**: Talk to and control any subagent you want.
 - **Life span**: Long-running or ephemeral agents, your choice.
 - **Customization**: Support all `tmux` commands you love.
+- **Team workspaces**: Each topology team instance gets a versioned `worktree/` and disposable `temp/`. [Inspect and restore file versions](docs/team-workspaces.md).
 
 Other features include messaging systems integration (e.g., Slack), computer use, and more.
 
@@ -41,7 +42,8 @@ Other features include messaging systems integration (e.g., Slack), computer use
 ### Prerequisites
 
 - tmux 3.0+
-- Rust 1.70+
+- Git (for team-instance workspaces and file snapshots)
+- Rust 1.89+
 - GNU Make
 - Node.js 22.13+ (to build Mission Control, which `make build` embeds)
 - [elan](https://github.com/leanprover/elan) (to build `omarc`, which `make install` installs alongside `omar`)
@@ -63,7 +65,7 @@ brew install omar-os/omar/omar
 
 ### Build from source
 
-Requires Rust 1.70+, GNU Make, and elan.
+Requires Rust 1.89+, GNU Make, and elan.
 
 ```bash
 git clone https://github.com/omar-os/omar.git

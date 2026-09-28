@@ -30,6 +30,7 @@ mod tmux;
 mod topology;
 mod ui;
 mod web_assets;
+mod workspace;
 
 use std::io;
 use std::path::PathBuf;
@@ -99,6 +100,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect and version team-instance files (not runtime checkpoints)
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceAction,
+    },
     /// Spawn a new agent session
     Spawn {
         /// Name for the agent session
@@ -259,6 +265,22 @@ enum Commands {
         #[arg(long)]
         ui: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceAction {
+    /// List workspaces owned by the selected EA
+    List,
+    /// Show workspace paths and immutable file snapshots
+    Show { id: String },
+    /// Snapshot all worktree files. Writers must be quiescent for a consistent version
+    Snapshot {
+        id: String,
+        #[arg(long, default_value = "Manual snapshot")]
+        label: String,
+    },
+    /// Restore files into a new workspace; does not rewind or resume a topology
+    Restore { id: String, snapshot: String },
 }
 
 #[derive(Subcommand)]
@@ -429,7 +451,7 @@ async fn async_main() -> Result<()> {
                 .map(|dir| deploy::record_path(&dir).exists())
                 .unwrap_or(false);
             if deployment {
-                kill_deployment(&omar_dir, target.id, &client, &name)
+                kill_deployment(&omar_dir, target.id, &name)
             } else {
                 kill_agent(
                     &client,
@@ -439,6 +461,41 @@ async fn async_main() -> Result<()> {
                     target.id,
                 )
             }
+        }
+        Some(Commands::Workspace { action }) => {
+            let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
+            let value = match action {
+                WorkspaceAction::List => {
+                    serde_json::to_value(workspace::list(&omar_dir, target.id)?)?
+                }
+                action => {
+                    let id = match &action {
+                        WorkspaceAction::Show { id }
+                        | WorkspaceAction::Snapshot { id, .. }
+                        | WorkspaceAction::Restore { id, .. } => id,
+                        WorkspaceAction::List => unreachable!(),
+                    };
+                    let ws = workspace::Workspace::load(&omar_dir, id)?;
+                    anyhow::ensure!(ws.ea_id == target.id, "workspace belongs to another EA");
+                    match action {
+                        WorkspaceAction::Show { .. } => serde_json::json!({
+                            "workspace": ws, "worktree": ws.worktree(&omar_dir),
+                            "temp": ws.temp(&omar_dir), "snapshots": ws.snapshots(&omar_dir)?,
+                        }),
+                        WorkspaceAction::Snapshot { label, .. } => {
+                            ws.ensure_inactive(&omar_dir)?;
+                            serde_json::to_value(ws.snapshot(&omar_dir, &label)?)?
+                        }
+                        WorkspaceAction::Restore { snapshot, .. } => {
+                            let restored = ws.restore(&omar_dir, &snapshot)?;
+                            serde_json::json!({"workspace": restored, "worktree": restored.worktree(&omar_dir), "temp": restored.temp(&omar_dir)})
+                        }
+                        WorkspaceAction::List => unreachable!(),
+                    }
+                }
+            };
+            println!("{}", serde_json::to_string_pretty(&value)?);
+            Ok(())
         }
         Some(Commands::Stop { deployment }) => {
             let target = resolve_cli_ea(&omar_dir, cli.ea.as_deref())?;
@@ -968,15 +1025,11 @@ fn status_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) ->
 
 /// Force kill: the runner dies first, then its sessions, then the record says
 /// CANCELLED. Also sweeps sessions a crashed run left behind.
-fn kill_deployment(
-    omar_dir: &std::path::Path,
-    ea_id: ea::EaId,
-    client: &TmuxClient,
-    team: &str,
-) -> Result<()> {
+fn kill_deployment(omar_dir: &std::path::Path, ea_id: ea::EaId, team: &str) -> Result<()> {
     let dir = deployment_dir(omar_dir, ea_id, team)?;
     let mut record = deploy::DeploymentRecord::load(&dir)?
         .ok_or_else(|| anyhow::anyhow!("no deployment '{}'", team))?;
+    let client = record.session_client()?;
     if record.pid != std::process::id() && record.runner_alive() {
         deploy::kill_process(record.pid);
         let waited = std::time::Instant::now();
@@ -984,17 +1037,27 @@ fn kill_deployment(
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    for failure in deploy::teardown_sessions(client, &record.sessions, &deploy::logs_dir(&dir)) {
+    let failures = if record.sessions_cleaned {
+        Vec::new()
+    } else {
+        deploy::teardown_sessions(&client, &record.sessions, &deploy::logs_dir(&dir))
+    };
+    for failure in &failures {
         eprintln!("warning: session not cleaned up: {failure}");
     }
+    record.sessions_cleaned = failures.is_empty();
     deploy::clear_stop(&dir)?;
     if record.is_active() {
         record.advance(
             deploy::DeploymentState::Cancelled,
             Some("killed by operator"),
         )?;
-        record.save(&dir)?;
     }
+    record.save(&dir)?;
+    anyhow::ensure!(
+        failures.is_empty(),
+        "deployment cleanup remains unconfirmed"
+    );
     println!("Deployment '{}' is {}", team, record.state);
     Ok(())
 }
