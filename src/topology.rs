@@ -873,16 +873,22 @@ fn zero_delay_reach(state: &VmState, port: &str) -> BTreeSet<String> {
 
 /// Reaction ids that must run after `id` at a tag it fires in.
 ///
-/// Four reasons to be ordered: one writes a port the other is triggered by,
-/// so the second cannot decide whether its trigger is present until the first
-/// has run; both write the same port, so the later declaration wins; they
-/// share an agent, which answers one invocation at a time; or they are code
-/// reactions of one instance that keeps state, and each reads what the earlier
-/// one wrote.
+/// Instantaneous data dependencies order producers before consumers. Reactions
+/// in the same team instance also follow definition order, even on different
+/// agents: they share a workspace. Shared agents and output ports retain their
+/// ordering constraints across instances.
 pub fn must_follow(state: &VmState, id: &str) -> BTreeSet<String> {
     let Some(reaction) = state.reactions.get(id) else {
         return BTreeSet::new();
     };
+    // A chain establishes the total order without materializing every
+    // transitive pair (quadratic storage for large team instances).
+    let next_in_instance = state
+        .reactions
+        .iter()
+        .filter(|(_, other)| other.instance == reaction.instance && other.order > reaction.order)
+        .min_by_key(|(_, other)| other.order)
+        .map(|(id, _)| id.as_str());
     // An action carries a microstep even at zero delay, so writing one settles
     // nothing at this tag and orders nobody.
     let instant_writes: BTreeSet<String> = reaction
@@ -905,19 +911,14 @@ pub fn must_follow(state: &VmState, id: &str) -> BTreeSet<String> {
                 .any(|effect| reaction.effects.contains(effect));
             // A reaction has no agent, so two of them share nothing here.
             let shares_agent = !reaction.agent.is_empty() && state_of.agent == reaction.agent;
-            let shares_state = state_of.instance == reaction.instance
-                && state_of.body.is_some()
-                && reaction.body.is_some()
-                && state
-                    .state_vars
-                    .values()
-                    .any(|var| var.instance == reaction.instance);
-            // Declaration order decides the last three; only the first is a
-            // dependency the program states rather than a tie to break.
+            let shares_instance = state_of.instance == reaction.instance;
+            // Definition order serializes a team's invocations; data
+            // dependencies must agree with it or verification rejects a cycle.
             reads
-                || ((shares_port || shares_agent || shares_state)
-                    && state_of.order > reaction.order
-                    && other.as_str() != id)
+                || next_in_instance == Some(other.as_str())
+                || (!shares_instance
+                    && (shares_port || shares_agent)
+                    && state_of.order > reaction.order)
         })
         .map(|(other, _)| other.clone())
         .collect()
@@ -4548,8 +4549,8 @@ mod tests {
                     {{"op":"define_port","kind":"input","name":"a_in","type":"int"}},
                     {{"op":"define_port","kind":"output","name":"b","type":"int"}},
                     {{"op":"define_port","kind":"input","name":"b_in","type":"int"}},
-                    {{"op":"connect_ports","source":"a","target":"a_in"}},
-                    {{"op":"connect_ports","source":"b","target":"b_in"{delay}}},
+                    {{"op":"connect_ports","source":"a","target":"a_in"{delay}}},
+                    {{"op":"connect_ports","source":"b","target":"b_in"}},
                     {{"op":"install_reaction","id":"reaction.0","agent":"left",
                      "triggers":["a_in"],"effects":["b"],"contract":"b","prompt":"p"}},
                     {{"op":"install_reaction","id":"reaction.1","agent":"right",
@@ -4569,8 +4570,8 @@ mod tests {
         let error = verified("").unwrap_err().to_string();
         assert!(error.contains("causality loop"), "{error}");
 
-        // One `after 0` anywhere in the cycle turns it into a walk through
-        // superdense time, which is a thing a run can do.
+        // Delay the backwards edge so data dependencies agree with the
+        // instance's definition order within each tag.
         verified(r#","delay":0"#).expect("a microstep breaks the loop");
         // As does real time.
         verified(r#","delay":5"#).expect("a delay breaks the loop");
@@ -4861,6 +4862,144 @@ mod tests {
         );
     }
 
+    fn independent_team_reactions() -> VmState {
+        let mut state = hr_state();
+        state
+            .reactions
+            .retain(|id, _| matches!(id.as_str(), "reaction.1" | "reaction.2"));
+        state
+    }
+
+    #[test]
+    fn different_agents_share_files_in_prompt_definition_order() {
+        struct Files {
+            path: PathBuf,
+            active: std::sync::atomic::AtomicBool,
+            order: Mutex<Vec<String>>,
+        }
+        impl ReactionExecutor for Files {
+            fn invoke(&self, spec: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+                use std::sync::atomic::Ordering;
+                assert!(
+                    !self.active.swap(true, Ordering::SeqCst),
+                    "same-team invocations overlap"
+                );
+                self.order.lock().unwrap().push(spec.reaction_id.clone());
+                if spec.reaction_id == "reaction.2" {
+                    thread::sleep(Duration::from_millis(20));
+                    fs::write(&self.path, "first invocation finished")?;
+                } else {
+                    assert_eq!(fs::read_to_string(&self.path)?, "first invocation finished");
+                }
+                self.active.store(false, Ordering::SeqCst);
+                Ok(BTreeMap::new())
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let executor = Files {
+            path: dir.path().join("artifact"),
+            active: std::sync::atomic::AtomicBool::new(false),
+            order: Mutex::new(Vec::new()),
+        };
+        let mut state = independent_team_reactions();
+        // Key/agent names must not determine order: the definition index does.
+        state.reactions.get_mut("reaction.1").unwrap().order = 30;
+        state.reactions.get_mut("reaction.2").unwrap().order = 20;
+        run_event_loop(
+            &state,
+            BTreeMap::from([("triage".into(), json!("ready"))]),
+            &executor,
+        )
+        .unwrap();
+        assert_eq!(
+            *executor.order.lock().unwrap(),
+            vec!["reaction.2", "reaction.1"]
+        );
+    }
+
+    #[test]
+    fn separate_team_instances_can_still_execute_in_parallel() {
+        struct Parallel {
+            entered: Mutex<usize>,
+            ready: std::sync::Condvar,
+        }
+        impl ReactionExecutor for Parallel {
+            fn invoke(&self, _: InvocationSpec) -> Result<BTreeMap<String, Value>> {
+                let mut count = self.entered.lock().unwrap();
+                *count += 1;
+                self.ready.notify_all();
+                let (count, _) = self
+                    .ready
+                    .wait_timeout_while(count, Duration::from_secs(5), |count| *count < 2)
+                    .unwrap();
+                anyhow::ensure!(*count == 2, "separate instances were serialized");
+                Ok(BTreeMap::new())
+            }
+        }
+        let mut state = independent_team_reactions();
+        state.reactions.get_mut("reaction.1").unwrap().instance = "parent".into();
+        state.reactions.get_mut("reaction.2").unwrap().instance = "parent.child".into();
+        let executor = Parallel {
+            entered: Mutex::new(0),
+            ready: std::sync::Condvar::new(),
+        };
+        run_event_loop(
+            &state,
+            BTreeMap::from([("triage".into(), json!("ready"))]),
+            &executor,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn instance_order_uses_a_linear_chain_even_with_shared_agents_and_effects() {
+        let mut state = independent_team_reactions();
+        let template = state.reactions["reaction.1"].clone();
+        state.reactions.clear();
+        let count = 128;
+        let ids: Vec<_> = (0..count)
+            .map(|order| format!("reaction.{}", count - order))
+            .collect();
+        for (order, id) in ids.iter().enumerate() {
+            let mut reaction = template.clone();
+            reaction.order = order;
+            state.reactions.insert(id.clone(), reaction);
+        }
+        // All reactions share an agent and an action effect, which must not
+        // reintroduce redundant same-instance ordering edges.
+        let edge_count: usize = ids.iter().map(|id| must_follow(&state, id).len()).sum();
+        assert_eq!(edge_count, count - 1);
+        assert_eq!(
+            precedence_layers(&state).unwrap(),
+            ids.iter().map(|id| vec![id.clone()]).collect::<Vec<_>>()
+        );
+        reject_causality_loops(&state).unwrap();
+
+        // A backwards data dependency still closes a cycle through the chain,
+        // even when the source and consumer are not adjacent definitions.
+        state.ports.get_mut("opinion1").unwrap().kind = PortKind::Input;
+        for reaction in state.reactions.values_mut() {
+            reaction.effects.clear();
+        }
+        state
+            .reactions
+            .get_mut(ids.last().unwrap())
+            .unwrap()
+            .effects = vec!["opinion1".into()];
+        state.reactions.get_mut(&ids[0]).unwrap().triggers = vec!["opinion1".into()];
+        assert!(precedence_layers(&state).is_err());
+        assert!(reject_causality_loops(&state).is_err());
+    }
+
+    #[test]
+    fn backwards_same_tag_dependency_conflicts_with_team_definition_order() {
+        let mut state = independent_team_reactions();
+        state.ports.get_mut("opinion2").unwrap().kind = PortKind::Input;
+        state.reactions.get_mut("reaction.1").unwrap().triggers = vec!["opinion2".into()];
+        assert!(precedence_layers(&state).is_err());
+        assert!(reject_causality_loops(&state).is_err());
+    }
+
     #[test]
     fn precedence_orders_overlapping_effects_and_same_agent() {
         let mut state = hr_state();
@@ -5114,10 +5253,9 @@ mod tests {
         );
     }
 
-    /// Two reactions with nothing in common but their instance are free
-    /// to run together, until that instance keeps state.
+    /// Both stateful and stateless reactions share their instance's workspace.
     #[test]
-    fn reactions_of_a_stateful_instance_run_in_declaration_order() {
+    fn reactions_of_an_instance_run_in_definition_order() {
         let second = r#"{"op":"define_port","instance":"c","kind":"output","name":"c.other","type":"int"},
             {"op":"install_reaction","instance":"c","id":"c.reaction.1","agent":"",
              "triggers":["c.tick"],"effects":["c.other"],"contract":"c.other","prompt":"","body":"unused"},"#;
@@ -5133,7 +5271,7 @@ mod tests {
             .instructions
             .retain(|i| !matches!(i, Instruction::DeclareState { .. }));
         let stateless = verify(&bytecode).unwrap();
-        assert!(must_follow(&stateless, "c.reaction.0").is_empty());
+        assert!(must_follow(&stateless, "c.reaction.0").contains("c.reaction.1"));
     }
 
     #[test]
