@@ -33,6 +33,7 @@ Terminal UI
 - **Full control**: Talk to and control any subagent you want.
 - **Life span**: Long-running or ephemeral agents, your choice.
 - **Customization**: Support all `tmux` commands you love.
+- **Team workspaces**: Each topology team instance gets a versioned `worktree/` and disposable `temp/`. [Inspect and restore file versions](docs/team-workspaces.md).
 
 Other features include messaging systems integration (e.g., Slack), computer use, and more.
 
@@ -41,9 +42,11 @@ Other features include messaging systems integration (e.g., Slack), computer use
 ### Prerequisites
 
 - tmux 3.0+
-- Rust 1.70+
+- Git (for team-instance workspaces and file snapshots)
+- Rust 1.89+
 - GNU Make
 - Node.js 22.13+ (to build Mission Control, which `make build` embeds)
+- [elan](https://github.com/leanprover/elan) (to build `omarc`, which `make install` installs alongside `omar`)
 - One or more coding agents [listed here](#supported-agent-backends).
 
 ### One-liner (recommended)
@@ -62,7 +65,7 @@ brew install omar-os/omar/omar
 
 ### Build from source
 
-Requires Rust 1.70+ and GNU Make.
+Requires Rust 1.89+, GNU Make, and elan.
 
 ```bash
 git clone https://github.com/omar-os/omar.git
@@ -125,6 +128,25 @@ Shutdown the test project and its agents.
 | [Cursor CLI](https://cursor.com/cli) | `omar -a cursor` |
 | [Opencode](https://github.com/anomalyco/opencode) | `omar -a opencode` |
 | [Google Antigravity CLI](https://antigravity.google/product/antigravity-cli) | `omar -a agy` |
+| [Pi](https://pi.dev) | `omar -a pi` |
+
+Each `omar -a <backend>` launch creates a new EA, named with its new EA number.
+Use `omar -a codex --ea Research` to give the new EA a semantic name. An existing
+name is rejected rather than replacing its manager. Run `omar --ea <id-or-name>`
+without `-a` to open an existing EA.
+
+Codex launch commands no longer disable the alternate screen. OMAR does not
+add `--no-alt-screen`; an explicit flag in a custom command is still respected.
+Remove that flag from an existing `default_command` to try the alternate screen,
+then launch a new session (running sessions keep their original arguments).
+
+The web terminal forwards Escape to the agent. Close with the **Close** button,
+**Ctrl+Shift+Escape**, or a click on the backdrop. New sessions use the launching
+terminal's dimensions, or 120×40 when headless. Web attachments start at the
+panel's measured size. After the last viewer in a daemon closes, OMAR restores
+the original size and sizing policy if no external client remains and the
+policy has not been changed. Concurrent clients still share tmux's window and
+its sizing policy; a manually sized window stays manual.
 
 ## License
 

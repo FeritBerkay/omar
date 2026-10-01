@@ -57,6 +57,26 @@ fn tmux(args: &[&str]) -> Result<String, String> {
     }
 }
 
+// Receive literal input instead of executing it in an interactive shell.
+// Disabling terminal echo ensures assertions observe bytes read by cat.
+const INPUT_RECEIVER: &str = "stty -echo; printf 'RECEIVER_READY\\n'; exec cat";
+
+fn wait_for_pane_output(session: &str, expected: &str) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let output =
+            tmux(&["capture-pane", "-t", session, "-p"]).expect("failed to capture receiver pane");
+        if output.contains(expected) {
+            return output;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Session {session} did not output {expected:?}: {output}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Kill a specific tmux session if it exists. Scoped per-test so
 /// concurrent tests don't clobber each other's sessions. Use this both
 /// at the start of a test (to clear leftovers from a prior failed run)
@@ -367,27 +387,27 @@ fn test_capture_pane() {
     let session_name = format!("{}capture", TEST_PREFIX);
     cleanup_session(&session_name);
 
-    // Create a session with a shell
-    let result = tmux(&["new-session", "-d", "-s", &session_name]);
+    // Use a plain shell so personal shell startup and prompt plugins cannot
+    // consume keystrokes or delay the output this test is checking.
+    let result = tmux(&["new-session", "-d", "-s", &session_name, "/bin/sh"]);
     assert!(result.is_ok(), "Failed to create session: {:?}", result);
-
-    // Give it time to start
-    thread::sleep(Duration::from_millis(200));
-
-    // Send echo command
-    let _ = tmux(&[
+    tmux(&[
         "send-keys",
         "-t",
         &session_name,
-        "echo HELLO_OMAR_TEST",
+        "printf 'HELLO_%s_TEST\\n' OMAR",
         "Enter",
-    ]);
+    ])
+    .unwrap();
 
-    // Give it time to execute
-    thread::sleep(Duration::from_millis(500));
-
-    // Capture pane content
-    let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let output = loop {
+        let output = tmux(&["capture-pane", "-t", &session_name, "-p"]).unwrap();
+        if output.contains("HELLO_OMAR_TEST") || std::time::Instant::now() >= deadline {
+            break output;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
     assert!(
         output.contains("HELLO_OMAR_TEST"),
         "Expected output not found: {}",
@@ -1069,7 +1089,7 @@ fn test_omar_mcp_server_tools_list_via_cli() {
     );
     assert_eq!(
         props["backend"]["enum"],
-        json!(["claude", "codex", "cursor", "opencode", "agy"]),
+        json!(["claude", "codex", "cursor", "opencode", "pi", "agy"]),
         "spawn_agent schema must advertise supported backend enum: {}",
         spawn_agent["inputSchema"]
     );
@@ -1121,7 +1141,7 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
     );
     assert!(
         spawned.get("task_id").is_none(),
-        "spawn_agent should not return task_id: {}",
+        "raw demo should not acquire autonomous task supervision: {}",
         spawned
     );
 
@@ -1175,7 +1195,7 @@ fn test_omar_mcp_server_spawn_agent_raw_command_via_cli() {
 }
 
 #[test]
-fn test_spawn_agent_task_is_metadata_only_via_cli() {
+fn test_spawn_agent_task_is_durable_and_visible_via_cli() {
     if !tmux_available() {
         eprintln!("Skipping test: tmux not available");
         return;
@@ -1198,6 +1218,7 @@ fn test_spawn_agent_task_is_metadata_only_via_cli() {
             "name": agent_name,
             "project_id": project_id,
             "task": "echo tracked-task-test",
+            "supervise": true,
             "command": "sleep 30",
         }),
     );
@@ -1208,8 +1229,8 @@ fn test_spawn_agent_task_is_metadata_only_via_cli() {
         Some(project_name.as_str())
     );
     assert!(
-        created.get("task_id").is_none(),
-        "spawn_agent should not return task_id: {}",
+        created["task_id"].as_str().is_some(),
+        "spawn_agent must return a durable task_id: {}",
         created
     );
 
@@ -1222,6 +1243,10 @@ fn test_spawn_agent_task_is_metadata_only_via_cli() {
 
     let summary = server.tool_call("get_agent_summary", json!({ "name": agent_name }));
     assert_eq!(summary["task"].as_str(), Some("echo tracked-task-test"));
+    let durable = server.tool_call("get_task", json!({"task_id":created["task_id"]}));
+    let content: Value = serde_json::from_str(durable["content"].as_str().unwrap()).unwrap();
+    assert_eq!(content["assignment"], "echo tracked-task-test");
+    assert_eq!(durable["status"], "running");
 
     let worker_tasks = fs::read_to_string(home.path().join(".omar/ea/0/worker_tasks.json"))
         .expect("worker_tasks.json");
@@ -1498,7 +1523,7 @@ fn test_integer_fields_accept_strings() {
     );
     assert!(
         created.get("task_id").is_none(),
-        "spawn_agent should not return task_id: {}",
+        "raw demo should not acquire autonomous task supervision: {}",
         created
     );
 
@@ -1582,14 +1607,14 @@ fn test_deliver_to_tmux_ea_scoped() {
     let _ = tmux(&["kill-session", "-t", &ea1_session]);
 
     // Create one agent session per EA
-    let r0 = tmux(&["new-session", "-d", "-s", &ea0_session]);
+    let r0 = tmux(&["new-session", "-d", "-s", &ea0_session, INPUT_RECEIVER]);
     assert!(
         r0.is_ok(),
         "Failed to create EA 0 session '{}': {:?}",
         ea0_session,
         r0
     );
-    let r1 = tmux(&["new-session", "-d", "-s", &ea1_session]);
+    let r1 = tmux(&["new-session", "-d", "-s", &ea1_session, INPUT_RECEIVER]);
     assert!(
         r1.is_ok(),
         "Failed to create EA 1 session '{}': {:?}",
@@ -1597,7 +1622,8 @@ fn test_deliver_to_tmux_ea_scoped() {
         r1
     );
 
-    thread::sleep(Duration::from_millis(200));
+    wait_for_pane_output(&ea0_session, "RECEIVER_READY");
+    wait_for_pane_output(&ea1_session, "RECEIVER_READY");
 
     // Deliver distinct messages replicating deliver_to_tmux's exact tmux operations:
     //   tmux send-keys -t <target> -l <message>
@@ -1605,33 +1631,14 @@ fn test_deliver_to_tmux_ea_scoped() {
     let msg_ea0 = "DELIVER_EA0_ONLY";
     let msg_ea1 = "DELIVER_EA1_ONLY";
 
-    let _ = tmux(&["send-keys", "-t", &ea0_session, "-l", msg_ea0]);
-    let _ = tmux(&["send-keys", "-t", &ea0_session, "Enter"]);
+    tmux(&["send-keys", "-t", &ea0_session, "-l", msg_ea0]).unwrap();
+    tmux(&["send-keys", "-t", &ea0_session, "Enter"]).unwrap();
 
-    let _ = tmux(&["send-keys", "-t", &ea1_session, "-l", msg_ea1]);
-    let _ = tmux(&["send-keys", "-t", &ea1_session, "Enter"]);
+    tmux(&["send-keys", "-t", &ea1_session, "-l", msg_ea1]).unwrap();
+    tmux(&["send-keys", "-t", &ea1_session, "Enter"]).unwrap();
 
-    thread::sleep(Duration::from_millis(500));
-
-    // Capture pane output for each session
-    let out0 = tmux(&["capture-pane", "-t", &ea0_session, "-p"]).unwrap_or_default();
-    let out1 = tmux(&["capture-pane", "-t", &ea1_session, "-p"]).unwrap_or_default();
-
-    // Each session must contain its own message
-    assert!(
-        out0.contains(msg_ea0),
-        "EA 0 session '{}' should contain '{}': {}",
-        ea0_session,
-        msg_ea0,
-        out0
-    );
-    assert!(
-        out1.contains(msg_ea1),
-        "EA 1 session '{}' should contain '{}': {}",
-        ea1_session,
-        msg_ea1,
-        out1
-    );
+    let out0 = wait_for_pane_output(&ea0_session, msg_ea0);
+    let out1 = wait_for_pane_output(&ea1_session, msg_ea1);
 
     // EA isolation: messages must not cross EA boundaries
     assert!(
@@ -1715,14 +1722,14 @@ fn test_scheduler_event_delivery_cycle_ea_scoped() {
     let _ = tmux(&["kill-session", "-t", &ea1_session]);
 
     // Create one session per EA
-    let r0 = tmux(&["new-session", "-d", "-s", &ea0_session]);
+    let r0 = tmux(&["new-session", "-d", "-s", &ea0_session, INPUT_RECEIVER]);
     assert!(
         r0.is_ok(),
         "Failed to create EA 0 session '{}': {:?}",
         ea0_session,
         r0
     );
-    let r1 = tmux(&["new-session", "-d", "-s", &ea1_session]);
+    let r1 = tmux(&["new-session", "-d", "-s", &ea1_session, INPUT_RECEIVER]);
     assert!(
         r1.is_ok(),
         "Failed to create EA 1 session '{}': {:?}",
@@ -1730,7 +1737,8 @@ fn test_scheduler_event_delivery_cycle_ea_scoped() {
         r1
     );
 
-    thread::sleep(Duration::from_millis(200));
+    wait_for_pane_output(&ea0_session, "RECEIVER_READY");
+    wait_for_pane_output(&ea1_session, "RECEIVER_READY");
 
     // Simulate format_delivery output for a single event (as run_event_loop would generate):
     //   "[EVENT at t=<ts>]\nFrom <sender>: <payload>"
@@ -1739,29 +1747,15 @@ fn test_scheduler_event_delivery_cycle_ea_scoped() {
     let payload_ea1 = format!("[EVENT at t={}]\nFrom ea-test: sched-ea1-only", ts);
 
     // Deliver to each session via the same tmux send-keys pattern as deliver_to_tmux
-    let _ = tmux(&["send-keys", "-t", &ea0_session, "-l", &payload_ea0]);
-    let _ = tmux(&["send-keys", "-t", &ea0_session, "Enter"]);
+    tmux(&["send-keys", "-t", &ea0_session, "-l", &payload_ea0]).unwrap();
+    tmux(&["send-keys", "-t", &ea0_session, "Enter"]).unwrap();
 
-    let _ = tmux(&["send-keys", "-t", &ea1_session, "-l", &payload_ea1]);
-    let _ = tmux(&["send-keys", "-t", &ea1_session, "Enter"]);
+    tmux(&["send-keys", "-t", &ea1_session, "-l", &payload_ea1]).unwrap();
+    tmux(&["send-keys", "-t", &ea1_session, "Enter"]).unwrap();
 
-    thread::sleep(Duration::from_millis(500));
-
-    // Capture pane output
-    let out0 = tmux(&["capture-pane", "-t", &ea0_session, "-p"]).unwrap_or_default();
-    let out1 = tmux(&["capture-pane", "-t", &ea1_session, "-p"]).unwrap_or_default();
-
-    // Each EA's session received its own event payload
-    assert!(
-        out0.contains("sched-ea0-only"),
-        "EA 0 session missing its scheduled event: {}",
-        out0
-    );
-    assert!(
-        out1.contains("sched-ea1-only"),
-        "EA 1 session missing its scheduled event: {}",
-        out1
-    );
+    // Wait for each complete event to be consumed, not just for input echo.
+    let out0 = wait_for_pane_output(&ea0_session, &payload_ea0);
+    let out1 = wait_for_pane_output(&ea1_session, &payload_ea1);
 
     // EA isolation: events must not cross EA boundaries
     assert!(

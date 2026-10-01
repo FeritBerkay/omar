@@ -85,14 +85,54 @@ pub struct DeploymentRecord {
     pub error: Option<String>,
     /// Agent name to tmux session, so teardown needs no re-verify.
     pub sessions: BTreeMap<String, String>,
+    /// Missing is unknown (legacy); explicit null is the default server.
+    #[serde(
+        default,
+        deserialize_with = "read_launch_server",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tmux_server: Option<Option<String>>,
+    /// Inherited TMUX socket when no explicit named server was selected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tmux_socket: Option<String>,
+    /// Confirmed teardown, independent of whether tmux still has a server/socket.
+    #[serde(default)]
+    pub sessions_cleaned: bool,
     /// Per-invocation timeout, which bounds a graceful stop.
     pub timeout_seconds: u64,
     pub history: Vec<TransitionEvent>,
+    /// The last value of every state variable, kept so a stopped run can be
+    /// read back and, once there is a resume, continued.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub state_vars: BTreeMap<String, serde_json::Value>,
+    /// Instance name to stable workspace id; retained after the run ends.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workspaces: BTreeMap<String, String>,
+}
+
+fn read_launch_server<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 impl DeploymentRecord {
     pub fn create(team: &str, sessions: BTreeMap<String, String>, timeout_seconds: u64) -> Self {
         let now = now_unix();
+        let named = std::env::var("OMAR_TMUX_SERVER")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let inherited = if named.is_none() {
+            std::env::var("TMUX").ok().filter(|s| !s.is_empty())
+        } else {
+            None
+        };
+        let socket = inherited
+            .as_ref()
+            .and_then(|value| value.rsplitn(3, ',').nth(2))
+            .filter(|path| Path::new(path).is_absolute())
+            .map(str::to_owned);
+        let identity_known = inherited.is_none() || socket.is_some();
         Self {
             deployment_id: uuid::Uuid::new_v4().to_string(),
             team: team.to_string(),
@@ -102,12 +142,17 @@ impl DeploymentRecord {
             finished_at: None,
             error: None,
             sessions,
+            tmux_server: identity_known.then_some(named),
+            tmux_socket: socket,
+            sessions_cleaned: false,
             timeout_seconds,
             history: vec![TransitionEvent {
                 state: DeploymentState::Created,
                 at: now,
                 detail: None,
             }],
+            state_vars: BTreeMap::new(),
+            workspaces: BTreeMap::new(),
         }
     }
 
@@ -130,6 +175,25 @@ impl DeploymentRecord {
     }
 
     pub fn save(&self, dir: &Path) -> Result<()> {
+        // Preserve ownership before replacing the latest run, including legacy
+        // records written before deployment history existed.
+        if let Some(previous) = Self::load(dir)? {
+            if previous.deployment_id != self.deployment_id {
+                anyhow::ensure!(
+                    !previous.deployment_id.is_empty()
+                        && previous
+                            .deployment_id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                    "invalid deployment id"
+                );
+                write_json_atomic(
+                    &dir.join("deployments")
+                        .join(format!("{}.json", previous.deployment_id)),
+                    &previous,
+                )?;
+            }
+        }
         write_json_atomic(&record_path(dir), self)
     }
 
@@ -143,6 +207,45 @@ impl DeploymentRecord {
         let record = serde_json::from_slice(&bytes)
             .with_context(|| format!("invalid deployment record {}", path.display()))?;
         Ok(Some(record))
+    }
+
+    /// Current and archived runs, so redeployment cannot erase workspace ownership.
+    pub fn load_all(dir: &Path) -> Result<Vec<Self>> {
+        let mut records = Vec::new();
+        let history = dir.join("deployments");
+        if history.exists() {
+            for entry in std::fs::read_dir(history)? {
+                let path = entry?.path();
+                if path.extension().is_some_and(|ext| ext == "json") {
+                    records.push(serde_json::from_slice(&std::fs::read(&path)?).with_context(
+                        || format!("invalid deployment record {}", path.display()),
+                    )?);
+                }
+            }
+        }
+        if let Some(current) = Self::load(dir)? {
+            records.retain(|record: &Self| record.deployment_id != current.deployment_id);
+            records.push(current);
+        }
+        Ok(records)
+    }
+
+    pub fn session_client(&self) -> Result<TmuxClient> {
+        let server = self.launch_server()?;
+        if let Some(socket) = &self.tmux_socket {
+            anyhow::ensure!(
+                Path::new(socket).is_absolute(),
+                "invalid recorded tmux socket"
+            );
+            return Ok(TmuxClient::on_socket(socket.clone()));
+        }
+        Ok(TmuxClient::on_server("", server.map(str::to_owned)))
+    }
+
+    pub fn launch_server(&self) -> Result<Option<&str>> {
+        self.tmux_server.as_ref().map(|server| server.as_deref()).context(
+            "deployment has no recorded tmux server; verify its original server and set tmux_server in its deployment record to that server name (or explicit null for the default server) before cleanup or snapshots"
+        )
     }
 
     pub fn is_active(&self) -> bool {
@@ -231,7 +334,7 @@ const CAPTURE_LINES: i32 = 10_000;
 
 impl SessionHost for TmuxClient {
     fn exists(&self, session: &str) -> Result<bool> {
-        self.has_session(session)
+        self.has_session_for_cleanup(session)
     }
 
     fn capture(&self, session: &str) -> Result<String> {
@@ -239,7 +342,7 @@ impl SessionHost for TmuxClient {
     }
 
     fn kill(&self, session: &str) -> Result<()> {
-        self.kill_session(session)
+        self.kill_session_tree(session)
     }
 }
 
@@ -324,6 +427,26 @@ mod tests {
         let states: Vec<_> = record.history.iter().map(|event| event.state).collect();
         use DeploymentState::*;
         assert_eq!(states, vec![Created, Deploying, Running, Terminated]);
+    }
+
+    #[test]
+    fn legacy_missing_server_is_not_an_explicit_default() {
+        let record = DeploymentRecord::create("Demo", BTreeMap::new(), 42);
+        let mut json = serde_json::to_value(record).unwrap();
+        json.as_object_mut().unwrap().remove("tmux_server");
+        let legacy: DeploymentRecord = serde_json::from_value(json.clone()).unwrap();
+        assert!(legacy.launch_server().is_err());
+        assert!(serde_json::to_value(legacy)
+            .unwrap()
+            .get("tmux_server")
+            .is_none());
+        json["tmux_server"] = serde_json::Value::Null;
+        let default: DeploymentRecord = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(default.launch_server().unwrap(), None);
+        assert!(serde_json::to_value(default).unwrap()["tmux_server"].is_null());
+        json["tmux_server"] = serde_json::json!("original-server");
+        let named: DeploymentRecord = serde_json::from_value(json).unwrap();
+        assert_eq!(named.launch_server().unwrap(), Some("original-server"));
     }
 
     #[test]
