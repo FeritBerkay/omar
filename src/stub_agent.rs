@@ -99,8 +99,8 @@ fn answer(topology: &TopologyMcpContext, fields: &BTreeMap<String, String>) -> R
 
 /// The simplest value the runtime's validator accepts for a declared type.
 fn stub_value(ty: &str) -> Value {
-    // A refined string admits only what it lists, so "stub" is not among the
-    // answers the validator would take. The first one always is.
+    // A refined string admits only what it lists, so "stub" may be illegal.
+    // verify rejects an empty refinement before the stub is launched.
     if let Some(allowed) = crate::topology::string_enum(ty) {
         return allowed.first().map(|o| json!(o)).unwrap_or(Value::Null);
     }

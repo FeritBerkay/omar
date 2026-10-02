@@ -3292,6 +3292,62 @@ mod tests {
     }
 
     #[test]
+    fn external_schema_compiles_and_enforces_the_imported_enum() {
+        let compiler = Path::new(env!("CARGO_MANIFEST_DIR")).join("lang/.lake/build/bin/omarc");
+        if !compiler.exists() {
+            eprintln!("skipping: {} has not been built", compiler.display());
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let schema = directory.path().join("decision.json");
+        let source = directory.path().join("review.omar");
+        fs::write(
+            &schema,
+            r#"{"type":"string","enum":["approved","needs_revision"]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &source,
+            r#"
+            type Decision from "decision.json"
+            team Review[reviewer : Codex] {
+                input request : string
+                output decision : Decision
+                prompt reviewer(request) -> decision "Review $(request)"
+            }
+            main { review = Review() }
+        "#,
+        )
+        .unwrap();
+        let bytecode = load_program_with_compiler(&source, Some(&compiler)).unwrap();
+        let plan = verify(&bytecode).unwrap();
+        let ty = &plan.ports["review.decision"].ty;
+        assert_eq!(ty, r#"string in ["approved","needs_revision"]"#);
+        validate_value(ty, &json!("approved")).unwrap();
+        let error = validate_value(ty, &json!("approved with revisions"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("needs_revision"), "{error}");
+        assert!(validate_value(ty, &json!({"decision":"approved"})).is_err());
+        // The bytecode embeds constraints; deployed validation needs no file.
+        fs::remove_file(&schema).unwrap();
+        validate_value(ty, &json!("needs_revision")).unwrap();
+        let error = load_program_with_compiler(&source, Some(&compiler))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("decision.json"), "{error}");
+        fs::write(
+            &schema,
+            r#"{"type":"string","enum":["approved"],"minLength":20}"#,
+        )
+        .unwrap();
+        let error = load_program_with_compiler(&source, Some(&compiler))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unsupported JSON Schema keyword"), "{error}");
+    }
+
+    #[test]
     fn verifies_initial_topology() {
         let state = verify(&program()).unwrap();
         assert_eq!(state.agents.len(), 1);
@@ -5176,6 +5232,86 @@ mod tests {
         let writes = completion.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(writes["opinion"], json!("second"));
         server.registry.remove("invocation-1");
+    }
+
+    #[test]
+    fn a_rejected_refinement_can_be_corrected_over_the_invocation_protocol() {
+        let server = InvocationServer::start().unwrap();
+        let context = TopologyMcpContext {
+            team: "Recovery".into(),
+            agent: "worker".into(),
+            endpoint: server.endpoint.clone(),
+            token: server.token.clone(),
+        };
+        let completion = server
+            .registry
+            .register(InvocationRecord {
+                id: "retry-1".into(),
+                team: "Recovery".into(),
+                agent: "worker".into(),
+                reaction: "reaction.0".into(),
+                contract: "decision".into(),
+                allowed_effects: BTreeMap::from([(
+                    "decision".into(),
+                    r#"string in ["continue","stop"]"#.into(),
+                )]),
+                trigger_values: BTreeMap::new(),
+                prompt: "Choose a permitted decision.".into(),
+                writes: BTreeMap::new(),
+                completed: false,
+            })
+            .unwrap();
+
+        // Exercise the real socket path, not just validate_value.
+        let error = mcp_set_port(
+            &context,
+            json!({
+                "invocation_id": "retry-1", "port": "decision",
+                "value": "this is a terminal record, not a forward"
+            }),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("decision"), "{error}");
+        assert!(error.contains("expected one of"), "{error}");
+        assert!(error.contains("\"continue\""), "{error}");
+        assert!(error.contains("\"stop\""), "{error}");
+
+        // Rejection must not satisfy the required output or release a result.
+        let error = mcp_complete(&context, json!({"invocation_id": "retry-1"}))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("effect contract 'decision' is not satisfied"),
+            "{error}"
+        );
+        assert!(matches!(
+            completion.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(!server.registry.answered("retry-1"));
+
+        let response = mcp_set_port(
+            &context,
+            json!({
+                "invocation_id": "retry-1", "port": "decision", "value": "continue"
+            }),
+        )
+        .unwrap();
+        assert_eq!(response["status"], json!("buffered"));
+        assert!(matches!(
+            completion.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let response = mcp_complete(&context, json!({"invocation_id": "retry-1"})).unwrap();
+        assert_eq!(response["status"], json!("complete"));
+        assert_eq!(
+            completion.recv_timeout(Duration::from_secs(1)).unwrap(),
+            BTreeMap::from([("decision".into(), json!("continue"))])
+        );
+        assert!(server.registry.answered("retry-1"));
+        server.registry.remove("retry-1");
     }
 
     #[test]
