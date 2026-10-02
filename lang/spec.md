@@ -585,6 +585,10 @@ strings, not JSON-encoded string documents. Allowed values appear in the agent's
 effect types. Descriptive schema metadata is not added to prompts in this version.
 Illegal writes return the allowed values and do not satisfy the output contract.
 This validates vocabulary, not the correctness of a decision or its routing.
+Enum ports, including nested enum types, cannot be triggers or effects of Rust
+code reactions in this version. The compiler rejects them because generated
+Rust `String` values do not enforce enum membership. Use an agent prompt for
+those ports; ordinary code reactions elsewhere in the topology remain supported.
 
 Pure compiler integrations can use `schemaImports` and
 `compileSourceWithSchemas`, supplying `(import path, JSON contents)` entries.

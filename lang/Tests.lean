@@ -459,6 +459,24 @@ def testExternalSchemas : IO Unit := do
       #[ ("e.json", escaped) ] with
   | .ok _ => pure ()
   | .error error => throw (IO.userError s!"escaped schema values: {error}")
+  -- Enum domains cannot be represented by the code reaction's Rust String.
+  for declarations in [
+      "input token : Decision output out : string reaction(token) -> out {= out = token; =}",
+      "input token : string output out : Decision reaction(token) -> out {= out = token; =}",
+      "input token : list<Decision> output out : string reaction(token) -> out {= out = None; =}",
+      "input token : string output out : option<Decision> reaction(token) -> out {= out = None; =}"] do
+    let coded := "type Decision from \"schemas/decision.json\" team T { " ++ declarations ++ " } main { t = T() }"
+    match compileSourceWithSchemas "CodeEnum" coded #[ ("schemas/decision.json", schema) ] with
+    | .error error =>
+      assertEqual "code enum rejected during compilation" (decide ((error.splitOn "cannot use enum port").length > 1)) true
+    | .ok _ => throw (IO.userError "accepted enum port in code reaction")
+  -- An enum elsewhere in the same topology does not disable ordinary Rust bodies.
+  let mixed := "type Decision from \"schemas/decision.json\" team T { " ++
+    "input decision : Decision input token : string output out : string " ++
+    "reaction(token) -> out {= out = token; =} } main { t = T() }"
+  match compileSourceWithSchemas "Mixed" mixed #[ ("schemas/decision.json", schema) ] with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"unrelated enum blocked code reaction: {error}")
   IO.println "external JSON Schema tests passed"
 
 

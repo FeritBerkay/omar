@@ -774,6 +774,12 @@ private def validate (program : Program) : Except String Program := do
   for reaction in program.reactions do
     if reaction.body.isNone && !containsName agentNames reaction.agent then
       throw s!"reaction references unknown agent '{reaction.agent}'"
+    if reaction.body.isSome then
+      for port in program.ports do
+        if (containsName reaction.triggers port.name || containsName reaction.effects port.name) &&
+            (port.type.splitOn "string in ").length > 1 then
+          throw s!"code reaction '{reaction.id}' cannot use enum port '{port.name}'; \
+            generated Rust strings do not enforce enum membership; use an agent prompt instead"
     for trigger in reaction.triggers do
       -- A reaction reads its own team's inputs and actions, and the *outputs*
       -- of teams its team instantiated. Reading its own output would be

@@ -1480,7 +1480,10 @@ fn validate_value(ty: &str, value: &Value) -> Result<()> {
 /// against the value it wrote rather than against the port.
 fn check_refinement(name: &str, ty: &str) -> Result<()> {
     for outer in ["list", "option"] {
-        if let Some(inner) = generic_inner(ty, outer) {
+        if ty.starts_with(&format!("{outer}<")) {
+            let Some(inner) = generic_inner(ty, outer) else {
+                bail!("port '{name}' has an invalid type '{ty}'");
+            };
             return check_refinement(name, inner);
         }
     }
@@ -3365,6 +3368,11 @@ mod tests {
             (r#"string in []"#, "admits no value"),
             // `validate_value` looks inside these, so `verify` must too.
             (r#"list<string in [oops>"#, "invalid string refinement"),
+            (r#"list<string in [oops"#, "invalid type"),
+            (r#"option<string in ["a"]"#, "invalid type"),
+            (r#"list<>"#, "invalid type"),
+            (r#"option<>"#, "invalid type"),
+            (r#"list<option<string in [oops>"#, "invalid type"),
             (r#"option<string in []>"#, "admits no value"),
             (
                 r#"list<option<string in [1,2]>>"#,
@@ -3406,6 +3414,23 @@ mod tests {
         assert!(validate_value(ty, &json!(1)).is_err());
         validate_value("list<string in [\"a\",\"b\"]>", &json!(["a", "b"])).unwrap();
         assert!(validate_value("list<string in [\"a\",\"b\"]>", &json!(["c"])).is_err());
+    }
+
+    #[test]
+    fn enum_cli_inputs_are_bare_text_and_still_validate_membership() {
+        let ty = r#"string in ["continue","stop"]"#;
+        let value = parse_input_value(ty, "continue").unwrap();
+        assert_eq!(value, json!("continue"));
+        validate_value(ty, &value).unwrap();
+        for raw in ["unknown", r#""continue""#] {
+            let value = parse_input_value(ty, raw).unwrap();
+            assert_eq!(value, json!(raw));
+            assert!(validate_value(ty, &value).is_err());
+        }
+        let nested = "list<string in [\"continue\",\"stop\"]>";
+        let value = parse_input_value(nested, r#"["continue","stop"]"#).unwrap();
+        validate_value(nested, &value).unwrap();
+        assert!(parse_input_value(nested, "continue").is_err());
     }
 
     #[test]
