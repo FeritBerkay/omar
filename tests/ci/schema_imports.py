@@ -70,9 +70,14 @@ class SchemaImports(unittest.TestCase):
             "https://json-schema.org/draft/2020-12/schema"}))
         result = self.compile()
         self.assertEqual(result.returncode, 0, result.stderr)
-        port = next(item for item in json.loads(self.output.read_text())["instructions"]
-            if item["op"] == "define_port")
+        instructions = json.loads(self.output.read_text())["instructions"]
+        port = next(item for item in instructions if item["op"] == "define_port")
         self.assertEqual(json.loads(port["type"].removeprefix("string in ")), values)
+        declared = next(item for item in instructions if item["op"] == "define_type")
+        self.assertEqual(declared["name"], "Decision")
+        self.assertEqual(declared["type"], port["type"])
+        self.assertEqual(declared["title"], "Decision")
+        self.assertEqual(declared["description"], "Choose one")
 
 
 if __name__ == "__main__":

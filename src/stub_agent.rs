@@ -72,19 +72,14 @@ fn answer(topology: &TopologyMcpContext, fields: &BTreeMap<String, String>) -> R
         .clone();
     // `effects` is a JSON object of port name to declared type, which is all a
     // stub needs to produce something the runtime will accept.
-    let effects: BTreeMap<String, String> = match fields.get("effects") {
-        Some(raw) => serde_json::from_str(raw).context("invalid effects")?,
-        None => BTreeMap::new(),
-    };
-
-    for (port, ty) in &effects {
+    for (port, ty) in effect_types(fields)? {
         send(
             topology,
             json!({
                 "op": "set_port",
                 "invocation_id": invocation_id,
                 "port": port,
-                "value": stub_value(ty),
+                "value": stub_value(&ty),
             }),
         )?;
     }
@@ -95,6 +90,33 @@ fn answer(topology: &TopologyMcpContext, fields: &BTreeMap<String, String>) -> R
     println!("stub agent answered {invocation_id}");
     std::io::stdout().flush().ok();
     Ok(())
+}
+
+/// The type the runtime checks each effect against.
+///
+/// `effects` is a JSON object of port name to type, which is all a stub needs
+/// to produce something the runtime will accept. An effect is spelled with the
+/// program's type names, and `types` maps each name back to its definition.
+fn effect_types(fields: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
+    let effects: BTreeMap<String, String> = match fields.get("effects") {
+        Some(raw) => serde_json::from_str(raw).context("invalid effects")?,
+        None => BTreeMap::new(),
+    };
+    let types: BTreeMap<String, crate::topology::TypeState> = match fields.get("types") {
+        Some(raw) => serde_json::from_str(raw).context("invalid types")?,
+        None => BTreeMap::new(),
+    };
+    let definitions: BTreeMap<String, String> = types
+        .into_iter()
+        .map(|(name, declared)| (name, declared.ty))
+        .collect();
+    Ok(effects
+        .into_iter()
+        .map(|(port, ty)| {
+            let ty = crate::topology::rename_type(&ty, &definitions);
+            (port, ty)
+        })
+        .collect())
 }
 
 /// The simplest value the runtime's validator accepts for a declared type.
@@ -176,5 +198,36 @@ mod tests {
         );
         let list = stub_value("list<string in [\"a\",\"b\"]>");
         assert_eq!(list, json!(["a"]));
+    }
+
+    #[test]
+    fn an_effect_named_by_type_resolves_to_what_the_runtime_checks() {
+        // The runtime spells an effect `Decision`, and the stub must still
+        // write a value the refinement admits.
+        let fields = BTreeMap::from([
+            (
+                "effects".to_string(),
+                r#"{"review.out":"Decision","review.all":"list<Decision>","review.note":"string"}"#
+                    .to_string(),
+            ),
+            (
+                "types".to_string(),
+                r#"{"Decision":{"type":"string in [\"continue\",\"stop\"]","description":"d"}}"#
+                    .to_string(),
+            ),
+        ]);
+        let types = effect_types(&fields).unwrap();
+        assert_eq!(types["review.out"], r#"string in ["continue","stop"]"#);
+        assert_eq!(
+            types["review.all"],
+            r#"list<string in ["continue","stop"]>"#
+        );
+        assert_eq!(types["review.note"], "string");
+        assert_eq!(stub_value(&types["review.out"]), json!("continue"));
+        assert_eq!(stub_value(&types["review.all"]), json!(["continue"]));
+
+        // A message with no named types is what it always was.
+        let plain = BTreeMap::from([("effects".to_string(), r#"{"memo":"string"}"#.to_string())]);
+        assert_eq!(effect_types(&plain).unwrap()["memo"], "string");
     }
 }

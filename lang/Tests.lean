@@ -459,17 +459,45 @@ def testExternalSchemas : IO Unit := do
       #[ ("e.json", escaped) ] with
   | .ok _ => pure ()
   | .error error => throw (IO.userError s!"escaped schema values: {error}")
-  -- Enum domains cannot be represented by the code reaction's Rust String.
+  -- A body may read an enum port: what arrives was checked when it was
+  -- written. It may not write one: its Rust String admits anything.
   for declarations in [
       "input token : Decision output out : string reaction(token) -> out {= out = token; =}",
+      "input token : list<Decision> output out : string reaction(token) -> out {= out = None; =}"] do
+    let coded := "type Decision from \"schemas/decision.json\" team T { " ++ declarations ++ " } main { t = T() }"
+    match compileSourceWithSchemas "CodeEnum" coded #[ ("schemas/decision.json", schema) ] with
+    | .ok _ => pure ()
+    | .error error => throw (IO.userError s!"enum trigger blocked code reaction: {error}")
+  for declarations in [
       "input token : string output out : Decision reaction(token) -> out {= out = token; =}",
-      "input token : list<Decision> output out : string reaction(token) -> out {= out = None; =}",
       "input token : string output out : option<Decision> reaction(token) -> out {= out = None; =}"] do
     let coded := "type Decision from \"schemas/decision.json\" team T { " ++ declarations ++ " } main { t = T() }"
     match compileSourceWithSchemas "CodeEnum" coded #[ ("schemas/decision.json", schema) ] with
     | .error error =>
-      assertEqual "code enum rejected during compilation" (decide ((error.splitOn "cannot use enum port").length > 1)) true
-    | .ok _ => throw (IO.userError "accepted enum port in code reaction")
+      assertEqual "code enum effect rejected during compilation" (decide ((error.splitOn "cannot write enum port").length > 1)) true
+    | .ok _ => throw (IO.userError "accepted enum port as code reaction effect")
+  -- The name and what the schema said about it reach the bytecode, so the
+  -- agent can be told `Decision` rather than the refinement spelled out.
+  let described := "{\"type\":\"string\",\"enum\":[\"approved\",\"needs_revision\"]," ++
+    "\"title\":\"Review decision\",\"description\":\"A canonical review decision\"}"
+  let bytecode ← match compileSourceWithSchemas "Review" source #[ ("schemas/decision.json", described) ] with
+    | .ok bytecode => pure bytecode
+    | .error error => throw (IO.userError s!"described schema: {error}")
+  let instructions ← match Json.parse bytecode >>= (·.getObjVal? "instructions") >>= Json.getArr? with
+    | .ok instructions => pure instructions
+    | .error error => throw (IO.userError error)
+  let declared := instructions.filter fun item => (item.getObjValAs? String "op").toOption == some "define_type"
+  assertEqual "one define_type per import" declared.size 1
+  for (field, expected) in [("name", "Decision"), ("type", "string in [\"approved\",\"needs_revision\"]"),
+      ("title", "Review decision"), ("description", "A canonical review decision")] do
+    assertEqual s!"define_type {field}" ((declared[0]!.getObjValAs? String field).toOption) (some expected)
+  assertEqual "define_type precedes the ports" ((instructions.toList.map fun item =>
+    (item.getObjValAs? String "op").toOption.getD "").take 2) ["begin_plan", "define_type"]
+  -- Absent metadata is absent, not an empty string.
+  match compileSourceWithSchemas "Review" source #[ ("schemas/decision.json", schema) ] with
+  | .ok bytecode =>
+      assertEqual "no title without one" (decide ((bytecode.splitOn "\"title\"").length > 1)) false
+  | .error error => throw (IO.userError s!"external schema: {error}")
   -- An enum elsewhere in the same topology does not disable ordinary Rust bodies.
   let mixed := "type Decision from \"schemas/decision.json\" team T { " ++
     "input decision : Decision input token : string output out : string " ++

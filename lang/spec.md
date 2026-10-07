@@ -585,10 +585,20 @@ strings, not JSON-encoded string documents. Allowed values appear in the agent's
 effect types. Descriptive schema metadata is not added to prompts in this version.
 Illegal writes return the allowed values and do not satisfy the output contract.
 This validates vocabulary, not the correctness of a decision or its routing.
-Enum ports, including nested enum types, cannot be triggers or effects of Rust
-code reactions in this version. The compiler rejects them because generated
-Rust `String` values do not enforce enum membership. Use an agent prompt for
-those ports; ordinary code reactions elsewhere in the topology remain supported.
+A Rust code reaction may read an enum port, including a nested one: the value
+it receives was checked against the enum when it was written, and the body sees
+it as a `String`. A code reaction cannot write an enum port, because the
+generated Rust `String` does not enforce enum membership; the compiler and the
+bytecode verifier both reject it. Write such a port from an agent prompt.
+
+Each import is also emitted as a `define_type` instruction, before the ports,
+carrying the name, the expanded type, and the schema's `title` and
+`description` when present. The VM checks nothing against it; it is how the
+agent is addressed. An invocation lists its effects by the program's type
+names, such as `{"review.out":"Decision"}`, adds a `types` header line mapping
+each name to the type the runtime checks, and describes each named type in
+prose before the prompt: the values it admits, then the title and description
+the schema gave it.
 
 Pure compiler integrations can use `schemaImports` and
 `compileSourceWithSchemas`, supplying `(import path, JSON contents)` entries.

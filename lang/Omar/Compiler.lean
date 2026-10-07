@@ -353,6 +353,17 @@ structure InstanceDecl where
   parent : String := ""
   deriving Repr
 
+/-- `type Decision from "./schemas/decision.json"`, as the bytecode carries it:
+    the name, the type it expands to, and what the schema said about it. Ports
+    carry the expanded type, so the VM never needs this; the agent does, to be
+    told `Decision` rather than the refinement spelled out. -/
+structure SchemaType where
+  name : String
+  type : String
+  title : Option String := none
+  description : Option String := none
+  deriving Repr
+
 /-- The elaborated program. Names are flattened into one namespace because that
     is what the VM runs, but which instance each name came from is kept: it is
     structure, and rediscovering it by splitting on '.' downstream would be
@@ -367,6 +378,7 @@ structure Program where
   reactions : Array Reaction
   states : Array StateVar
   params : Array ParamVal
+  types : Array SchemaType := #[]
   deriving Repr
 
 abbrev Parser (α : Type) := List Token -> Except String (α × List Token)
@@ -774,12 +786,15 @@ private def validate (program : Program) : Except String Program := do
   for reaction in program.reactions do
     if reaction.body.isNone && !containsName agentNames reaction.agent then
       throw s!"reaction references unknown agent '{reaction.agent}'"
+    -- A body may read an enum port: what arrives was checked against the enum
+    -- when it was written. It may not write one, because the Rust `String` it
+    -- writes through admits anything.
     if reaction.body.isSome then
       for port in program.ports do
-        if (containsName reaction.triggers port.name || containsName reaction.effects port.name) &&
+        if containsName reaction.effects port.name &&
             (port.type.splitOn "string in ").length > 1 then
-          throw s!"code reaction '{reaction.id}' cannot use enum port '{port.name}'; \
-            generated Rust strings do not enforce enum membership; use an agent prompt instead"
+          throw s!"code reaction '{reaction.id}' cannot write enum port '{port.name}'; \
+            generated Rust strings do not enforce enum membership; write it from an agent prompt instead"
     for trigger in reaction.triggers do
       -- A reaction reads its own team's inputs and actions, and the *outputs*
       -- of teams its team instantiated. Reading its own output would be
@@ -1001,6 +1016,16 @@ private def instruction (op : String) (fields : List (String × Json) := []) : S
 
 def compile (program : Program) : String :=
   let begin := instruction "begin_plan" [("team", toJson program.team)]
+  let types := program.types.map fun declared =>
+    let fields := [
+      ("name", toJson declared.name),
+      ("type", toJson declared.type)
+    ] ++ (match declared.title with
+      | some title => [("title", toJson title)]
+      | none => []) ++ match declared.description with
+      | some description => [("description", toJson description)]
+      | none => []
+    instruction "define_type" fields
   let instances := program.instances.map fun inst =>
     instruction "declare_instance" [
       ("name", toJson inst.name),
@@ -1069,15 +1094,23 @@ def compile (program : Program) : String :=
     instruction "install_reaction" fields
   let commit := instruction "commit_plan"
   let instructions :=
-    #[begin] ++ instances ++ agents ++ ports ++ timers ++ states ++ params ++ connections ++ reactions ++
-      #[commit]
+    #[begin] ++ types ++ instances ++ agents ++ ports ++ timers ++ states ++ params ++ connections ++
+      reactions ++ #[commit]
   let rendered := String.intercalate ",\n    " instructions.toList
   "{\n  \"version\": 1,\n  \"team\": " ++ (toJson program.team).compress ++
     ",\n  \"instructions\": [\n    " ++ rendered ++ "\n  ]\n}\n"
 
+/-- What a string enum schema says: the values, and the `title` and
+    `description` it may carry, which are shown to the agent. -/
+structure EnumSchema where
+  values : Array String
+  title : Option String := none
+  description : Option String := none
+  deriving Repr
+
 /-- External schemas are deliberately restricted to string enums for now.
     Never silently ignore a validation keyword we do not implement. -/
-def stringEnumSchema (source : String) : Except String (Array String) := do
+def stringEnumSchema (source : String) : Except String EnumSchema := do
   let schema ← Json.parse source
   let fields ← schema.getObj?
   for (key, _) in fields.toArray do
@@ -1085,9 +1118,11 @@ def stringEnumSchema (source : String) : Except String (Array String) := do
       throw s!"unsupported JSON Schema keyword '{key}'; only string enums are supported"
   if (← schema.getObjValAs? String "type") != "string" then
     throw "only JSON Schema string enums are supported"
-  for key in ["$schema", "title", "description"] do
+  let metadata ← ["$schema", "title", "description"].mapM fun key => do
     if fields.contains key then
-      let _ ← schema.getObjValAs? String key
+      pure (some (← schema.getObjValAs? String key))
+    else
+      pure none
   let entries ← (← schema.getObjVal? "enum").getArr?
   if entries.isEmpty then throw "a string enum schema must list at least one value"
   let values ← entries.mapM Json.getStr?
@@ -1095,7 +1130,7 @@ def stringEnumSchema (source : String) : Except String (Array String) := do
   for value in values do
     if seen.contains value then throw s!"duplicate JSON Schema enum value {toJson value}"
     seen := seen.push value
-  pure values
+  pure { values, title := metadata[1]!, description := metadata[2]! }
 
 /-- Imports precede team declarations. The compiler CLI resolves paths; pure
     callers supply schema contents explicitly, without filesystem access. -/
@@ -1124,15 +1159,18 @@ def schemaImports (source : String) : Except String (Array (String × String)) :
 def compileSourceWithSchemas (programName source : String)
     (schemas : Array (String × String)) : Except String String := do
   let (imports, tokens) ← parseSchemaImports #[] (← lex source)
-  let aliases ← imports.mapM fun (name, path) => do
+  let types ← imports.mapM fun (name, path) => do
     let contents ← match schemas.find? (fun entry => entry.1 == path) with
       | some (_, contents) => pure contents
       | none => throw s!"schema type '{name}': no contents supplied for '{path}'"
-    let values ← match stringEnumSchema contents with
-      | .ok values => pure values
+    let schema ← match stringEnumSchema contents with
+      | .ok schema => pure schema
       | .error error => throw s!"schema type '{name}' from '{path}': {error}"
-    pure (name, "string in " ++ (Json.arr (values.map toJson)).compress)
-  pure (compile (← parse programName tokens aliases))
+    pure { name, type := "string in " ++ (Json.arr (schema.values.map toJson)).compress
+           title := schema.title, description := schema.description : SchemaType }
+  let aliases := types.map fun declared => (declared.name, declared.type)
+  let program ← parse programName tokens aliases
+  pure (compile { program with types })
 
 def compileSource (programName : String) (source : String) : Except String String :=
   compileSourceWithSchemas programName source #[]
