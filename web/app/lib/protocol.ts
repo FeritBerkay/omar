@@ -208,6 +208,11 @@ export type RunRequest = {
   program: string;
   inputs: Record<string, unknown>;
   conversation_id?: string;
+  /**
+   * Files the program imports, by the relative path it imports them under.
+   * Staged beside the program; absent, the program imports nothing.
+   */
+  files?: Record<string, string>;
 };
 
 /**

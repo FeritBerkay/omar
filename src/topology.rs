@@ -283,6 +283,29 @@ pub fn load_program(path: &Path) -> Result<Bytecode> {
 }
 
 fn load_program_with_compiler(path: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
+    load_program_with(path, compiler, Imports::Anywhere)
+}
+
+/// Compile and load a program that was staged from a request.
+///
+/// The operator did not point the compiler at this file; a client sent its
+/// text, and the daemon wrote it down. What it imports is confined to the
+/// directory it was written in -- the files that came with it -- so a
+/// program sent over the wire cannot read the host's files by naming them.
+pub fn load_staged_program(path: &Path) -> Result<Bytecode> {
+    load_program_with(path, None, Imports::Local)
+}
+
+/// What a program may import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Imports {
+    /// Anything the operator can read: they chose the file.
+    Anywhere,
+    /// Relative paths inside the program's own directory only.
+    Local,
+}
+
+fn load_program_with(path: &Path, compiler: Option<&Path>, imports: Imports) -> Result<Bytecode> {
     if path.extension().and_then(|extension| extension.to_str()) != Some("omar") {
         bail!(
             "OMAR programs must use the .omar extension: {}",
@@ -290,7 +313,7 @@ fn load_program_with_compiler(path: &Path, compiler: Option<&Path>) -> Result<By
         );
     }
 
-    compile_source(path, compiler)
+    compile_source(path, compiler, imports)
 }
 
 /// Where a program's generated artifacts go.
@@ -316,7 +339,7 @@ pub fn generated_dir(source: &Path) -> PathBuf {
     root.join("src-gen").join(stem)
 }
 
-fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
+fn compile_source(source: &Path, compiler: Option<&Path>, imports: Imports) -> Result<Bytecode> {
     let generated = generated_dir(source);
     fs::create_dir_all(&generated)
         .with_context(|| format!("failed to create {}", generated.display()))?;
@@ -373,17 +396,17 @@ fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
         .map(Path::to_path_buf)
         .unwrap_or_else(resolve_omarc);
 
-    let output = Command::new(&compiler)
-        .arg(source)
-        .arg(&draft)
-        .output()
-        .with_context(|| {
-            format!(
-                "failed to invoke OMAR compiler '{}'; install omarc beside omar, \
+    let mut command = Command::new(&compiler);
+    if imports == Imports::Local {
+        command.arg("--local-imports");
+    }
+    let output = command.arg(source).arg(&draft).output().with_context(|| {
+        format!(
+            "failed to invoke OMAR compiler '{}'; install omarc beside omar, \
                  add it to PATH, or set OMARC_BIN",
-                compiler.display()
-            )
-        })?;
+            compiler.display()
+        )
+    })?;
     if !output.status.success() {
         let _ = fs::remove_file(&draft);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -1612,8 +1635,21 @@ fn check_type(what: &str, name: &str, ty: &str) -> Result<()> {
     }
     if let Some(list) = ty.strip_prefix("string in ") {
         return match serde_json::from_str::<Vec<String>>(list) {
-            Ok(values) if !values.is_empty() => Ok(()),
-            Ok(_) => bail!("{what} '{name}' admits no value"),
+            Ok(values) if values.is_empty() => bail!("{what} '{name}' admits no value"),
+            Ok(values) => {
+                // `omarc` refuses a duplicate; so does the plan, or the bytecode
+                // is the one place the rule does not hold.
+                let mut seen = BTreeSet::new();
+                for value in &values {
+                    if !seen.insert(value) {
+                        bail!(
+                            "{what} '{name}' has a duplicate enum value {}",
+                            json!(value)
+                        );
+                    }
+                }
+                Ok(())
+            }
             Err(error) => bail!("{what} '{name}' has an invalid string refinement: {error}"),
         };
     }
@@ -3575,6 +3611,66 @@ mod tests {
     }
 
     #[test]
+    fn a_staged_program_imports_from_its_own_directory_only() {
+        let compiler = Path::new(env!("CARGO_MANIFEST_DIR")).join("lang/.lake/build/bin/omarc");
+        if !compiler.exists() {
+            eprintln!("skipping: {} has not been built", compiler.display());
+            return;
+        }
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = outside.path().join("decision.json");
+        fs::write(
+            &elsewhere,
+            r#"{"type":"string","enum":["approved","needs_revision"]}"#,
+        )
+        .unwrap();
+        let directory = outside.path().join("staged");
+        fs::create_dir_all(directory.join("schemas")).unwrap();
+        fs::copy(&elsewhere, directory.join("schemas/decision.json")).unwrap();
+        let program = |import: &str| {
+            format!(
+                r#"
+                type Decision from "{import}"
+                team Review[reviewer : Codex] {{
+                    input request : string
+                    output decision : Decision
+                    prompt reviewer(request) -> decision "Review $(request)"
+                }}
+                main {{ review = Review() }}
+            "#
+            )
+        };
+        let source = directory.join("review.omar");
+
+        // The operator's compiler reads what the operator names.
+        fs::write(&source, program(&elsewhere.display().to_string())).unwrap();
+        load_program_with(&source, Some(&compiler), Imports::Anywhere).unwrap();
+        fs::write(&source, program("../decision.json")).unwrap();
+        load_program_with(&source, Some(&compiler), Imports::Anywhere).unwrap();
+
+        // A staged one reads only what came with it.
+        for import in [
+            elsewhere.display().to_string(),
+            "../decision.json".to_string(),
+            "schemas/../../decision.json".to_string(),
+            "schemas\\decision.json".to_string(),
+        ] {
+            fs::write(&source, program(&import)).unwrap();
+            let error = load_program_with(&source, Some(&compiler), Imports::Local)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("inside the program's directory"),
+                "{import} gave {error}"
+            );
+        }
+        for import in ["schemas/decision.json", "./schemas/decision.json"] {
+            fs::write(&source, program(import)).unwrap();
+            load_program_with(&source, Some(&compiler), Imports::Local).unwrap();
+        }
+    }
+
+    #[test]
     fn verifies_initial_topology() {
         let state = verify(&program()).unwrap();
         assert_eq!(state.agents.len(), 1);
@@ -3824,6 +3920,8 @@ mod tests {
             (r#"list<option<int>>>"#, "invalid type"),
             (r#"list<strin>"#, "invalid type"),
             (r#"text"#, "invalid type"),
+            (r#"string in ["a","a"]"#, "duplicate enum value"),
+            (r#"list<string in ["a","b","a"]>"#, "duplicate enum value"),
             (r#"list<option<string in [oops>"#, "invalid type"),
             (r#"option<string in []>"#, "admits no value"),
             (
