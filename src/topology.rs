@@ -451,11 +451,15 @@ fn read_claim(path: &Path) -> String {
 /// Tells one compile's draft from another's in the same process.
 static DRAFTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn resolve_omarc() -> PathBuf {
+pub(crate) fn resolve_omarc() -> PathBuf {
     if let Some(path) = std::env::var_os("OMARC_BIN") {
         return PathBuf::from(path);
     }
 
+    resolve_build_omarc()
+}
+
+pub(crate) fn resolve_build_omarc() -> PathBuf {
     let executable_name = format!("omarc{}", std::env::consts::EXE_SUFFIX);
     if let Ok(current_executable) = std::env::current_exe() {
         if let Some(directory) = current_executable.parent() {
@@ -1957,7 +1961,6 @@ pub struct TopologyRunConfig<'a> {
     /// Where this program's generated artifacts go, from `generated_dir`.
     pub generated: &'a Path,
     pub base_prefix: &'a str,
-    pub default_workdir: &'a str,
     pub health_idle_warning: i64,
     pub inputs: &'a [String],
     pub replace: bool,
@@ -1997,6 +2000,13 @@ pub struct PanelAccess {
 pub enum RunEnd {
     Completed,
     Stopped,
+}
+
+/// How a run ended, with the output ports and state variables it ended with.
+pub struct RunOutcome {
+    pub end: RunEnd,
+    pub outputs: BTreeMap<String, Value>,
+    pub state: BTreeMap<String, Value>,
 }
 
 /// Advance the shared record and persist it, as one step.
@@ -2055,7 +2065,7 @@ fn fail_deployment(
     let _ = deploy::clear_stop(dir);
 }
 
-pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Result<RunEnd> {
+pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Result<RunOutcome> {
     let state = verify(bytecode)?;
     let runtime_dir = deploy::dir_for(config.omar_dir, config.ea_id, &state.team);
     fs::create_dir_all(&runtime_dir)?;
@@ -2165,13 +2175,8 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
             .map_err(|_| anyhow::anyhow!("deployment record lock poisoned"))?
             .deployment_id
             .clone();
-        let workspaces = crate::workspace::for_topology(
-            config.omar_dir,
-            config.ea_id,
-            &deployment_id,
-            &state,
-            Path::new(config.default_workdir),
-        )?;
+        let workspaces =
+            crate::workspace::for_topology(config.omar_dir, config.ea_id, &deployment_id, &state)?;
         {
             let mut guard = record
                 .lock()
@@ -2354,16 +2359,20 @@ pub fn run_topology(bytecode: &Bytecode, config: TopologyRunConfig<'_>) -> Resul
     } else {
         println!("Topology '{}' completed", state.team);
     }
-    for (port, value) in outputs {
+    for (port, value) in &outputs {
         println!("Output {port} = {value}");
     }
-    for (name, value) in state_vars {
+    for (name, value) in &state_vars {
         println!("State {name} = {value}");
     }
-    Ok(if stopped {
-        RunEnd::Stopped
-    } else {
-        RunEnd::Completed
+    Ok(RunOutcome {
+        end: if stopped {
+            RunEnd::Stopped
+        } else {
+            RunEnd::Completed
+        },
+        outputs,
+        state: state_vars,
     })
 }
 
