@@ -300,6 +300,13 @@ run_case Depths Depths watch.verdict --input src.go=1
 # code body. The stub picks the first value each type admits.
 run_case SchemaEnum SchemaEnum review.decision,review.priority,dispatch.route \
   --input review.request='route this'
+# The same types inside list and option, crossing connections between two
+# prompt teams.
+run_case SchemaNested SchemaNested triage.decisions,triage.priority,summary.report \
+  --input triage.request='triage this'
+# An enum input from the command line. CI also runs this with a value outside
+# the enum and checks the run is refused; here only the admitted value runs.
+run_case SchemaInput SchemaInput gate.note,gate.route --input gate.decision=stop
 run_case Recurrence Recurrence rec.result --input rec.start=0
 # Three instances wired into a ring. Only the seed is supplied; the other two
 # inputs come off the ring itself.
