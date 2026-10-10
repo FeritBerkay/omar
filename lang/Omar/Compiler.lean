@@ -220,6 +220,10 @@ structure Port where
   type : String
   delay : Option Nat := none
   instance_ : String := ""
+  /-- The type as the source spelled it, when that names an imported type:
+      `list<Decision>` where `type` is the expanded refinement. The VM checks
+      `type`; this is how the agent is told the name the program used. -/
+  declared : Option String := none
   deriving Repr
 
 /-- `timer t(offset, period)`.
@@ -403,24 +407,43 @@ private def natural : Parser Nat
   | Token.nat value :: rest => pure (value, rest)
   | tokens => throw s!"expected natural number, found {reprStr tokens.head?}"
 
-private partial def parseType (aliases : Array (String × String)) : Parser String
-  | Token.word "bool" :: rest => pure ("bool", rest)
-  | Token.word "int" :: rest => pure ("int", rest)
-  | Token.word "float" :: rest => pure ("float", rest)
-  | Token.word "string" :: rest => pure ("string", rest)
-  | Token.word "path" :: rest => pure ("path", rest)
-  | Token.word "bytes" :: rest => pure ("bytes", rest)
+/-- A type as the VM sees it and as the source spelled it. The two differ only
+    where an imported name is used: `list<Decision>` expands to the
+    refinement, and the spelling is kept so the agent can be told the name. -/
+private partial def parseType (aliases : Array (String × String)) : Parser (String × String)
+  | Token.word "bool" :: rest => pure (("bool", "bool"), rest)
+  | Token.word "int" :: rest => pure (("int", "int"), rest)
+  | Token.word "float" :: rest => pure (("float", "float"), rest)
+  | Token.word "string" :: rest => pure (("string", "string"), rest)
+  | Token.word "path" :: rest => pure (("path", "path"), rest)
+  | Token.word "bytes" :: rest => pure (("bytes", "bytes"), rest)
   | Token.word outer :: Token.sym "<" :: rest => do
       if outer != "list" && outer != "option" then
         throw s!"unknown generic type '{outer}'"
-      let (inner, rest) ← parseType aliases rest
+      let ((inner, spelled), rest) ← parseType aliases rest
       let (_, rest) ← expectSym ">" rest
-      pure (s!"{outer}<{inner}>", rest)
+      pure ((s!"{outer}<{inner}>", s!"{outer}<{spelled}>"), rest)
   | Token.word value :: rest =>
       match aliases.find? (fun entry => entry.1 == value) with
-      | some (_, type) => pure (type, rest)
+      | some (_, type) => pure ((type, value), rest)
       | none => throw s!"unknown port type '{value}'"
   | tokens => throw s!"expected port type, found {reprStr tokens.head?}"
+
+/-- The spelling worth keeping: none when the source wrote the type as the VM
+    sees it. -/
+private def declaredName (type spelled : String) : Option String :=
+  if spelled == type then none else some spelled
+
+/-- A type for a port. Only a port may carry an imported type: the runtime
+    holds state and parameters in built-in types alone, so accepting one here
+    would compile a program that can never run. -/
+private def parseScalarType (what : String) (aliases : Array (String × String))
+    (name : String) : Parser String := fun tokens => do
+  let ((type, spelled), rest) ← parseType aliases tokens
+  if spelled != type then
+    throw s!"{what} '{name}' cannot have schema type '{spelled}'; \
+      state and parameters take built-in types, and a schema type is for ports"
+  pure (type, rest)
 
 private partial def parseAgents (tokens : List Token) : Except String (Array Agent × List Token) := do
   match tokens with
@@ -442,7 +465,7 @@ private partial def parseParams (aliases : Array (String × String)) (tokens : L
   | _ =>
       let (name, tokens) ← word tokens
       let (_, tokens) ← expectSym ":" tokens
-      let (type, tokens) ← parseType aliases tokens
+      let (type, tokens) ← parseScalarType "parameter" aliases name tokens
       let param := { name, type : Param }
       match tokens with
       | Token.sym "," :: rest =>
@@ -564,20 +587,26 @@ private partial def parseDeclarations
   | Token.word "input" :: rest => do
       let (name, rest) ← word rest
       let (_, rest) ← expectSym ":" rest
-      let (type, rest) ← parseType aliases rest
-      parseDeclarations aliases reactionIndex (ports.push { name, kind := .input, type }) timers connections reactions instances states rest
+      let ((type, spelled), rest) ← parseType aliases rest
+      parseDeclarations aliases reactionIndex
+        (ports.push { name, kind := .input, type, declared := declaredName type spelled })
+        timers connections reactions instances states rest
   | Token.word "output" :: rest => do
       let (name, rest) ← word rest
       let (_, rest) ← expectSym ":" rest
-      let (type, rest) ← parseType aliases rest
-      parseDeclarations aliases reactionIndex (ports.push { name, kind := .output, type }) timers connections reactions instances states rest
+      let ((type, spelled), rest) ← parseType aliases rest
+      parseDeclarations aliases reactionIndex
+        (ports.push { name, kind := .output, type, declared := declaredName type spelled })
+        timers connections reactions instances states rest
   | Token.word "action" :: rest => do
       let (name, rest) ← word rest
       let (delay, rest) ← parseActionDelay rest
       match rest with
       | Token.sym ":" :: tail =>
-          let (type, tail) ← parseType aliases tail
-          parseDeclarations aliases reactionIndex (ports.push { name, kind := .action, type, delay }) timers connections reactions instances states tail
+          let ((type, spelled), tail) ← parseType aliases tail
+          parseDeclarations aliases reactionIndex
+            (ports.push { name, kind := .action, type, delay, declared := declaredName type spelled })
+            timers connections reactions instances states tail
       | _ =>
           parseDeclarations aliases reactionIndex (ports.push { name, kind := .action, type := "signal", delay }) timers connections reactions instances states rest
   | Token.word "timer" :: rest => do
@@ -592,7 +621,7 @@ private partial def parseDeclarations
   | Token.word "state" :: rest => do
       let (name, rest) ← word rest
       let (_, rest) ← expectSym ":" rest
-      let (type, rest) ← parseType aliases rest
+      let (type, rest) ← parseScalarType "state" aliases name rest
       let (_, rest) ← expectSym "=" rest
       let (initial, rest) ← literal rest
       parseDeclarations aliases reactionIndex ports timers connections reactions instances
@@ -788,9 +817,15 @@ private def validate (program : Program) : Except String Program := do
       throw s!"reaction references unknown agent '{reaction.agent}'"
     -- A body may read an enum port: what arrives was checked against the enum
     -- when it was written. It may not write one, because the Rust `String` it
-    -- writes through admits anything.
+    -- writes through admits anything. And it carries scalars only, so a
+    -- `list` or `option` port is out of its reach either way -- said here,
+    -- where the source is, rather than by the verifier against the bytecode.
     if reaction.body.isSome then
       for port in program.ports do
+        if containsName reaction.triggers port.name || containsName reaction.effects port.name then
+          if port.type.startsWith "list<" || port.type.startsWith "option<" then
+            throw s!"code reaction '{reaction.id}' cannot use port '{port.name}' of type \
+              {port.declared.getD port.type}; a body carries int, float, bool, string, path or bytes"
         if containsName reaction.effects port.name &&
             (port.type.splitOn "string in ").length > 1 then
           throw s!"code reaction '{reaction.id}' cannot write enum port '{port.name}'; \
@@ -1044,7 +1079,9 @@ def compile (program : Program) : String :=
       ("kind", toJson (kindName port.kind)),
       ("name", toJson port.name),
       ("type", toJson port.type)
-    ] ++ match port.delay with
+    ] ++ (match port.declared with
+      | some declared => [("declared", toJson declared)]
+      | none => []) ++ match port.delay with
       | some delay => [("delay", toJson delay)]
       | none => []
     instruction "define_port" fields

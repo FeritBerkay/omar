@@ -362,7 +362,7 @@ jobs:
 
           field_rank = {
               "op": 0, "instance": 1, "kind": 2, "name": 3, "type": 4,
-              "delay": 5, "backend": 6, "team": 7
+              "declared": 5, "delay": 6, "backend": 7, "team": 8
           }
           reaction_order = [
               "op", "instance", "id", "agent", "triggers", "effects",
@@ -383,10 +383,17 @@ jobs:
                   ranked = [field_rank[key] for key in keys if key in field_rank]
                   assert ranked == sorted(ranked), (path, keys)
                   if instruction["op"] == "define_port":
+                      # `declared` is how the program spelled an imported
+                      # type, and is absent when it spelled the type itself.
                       assert keys in (
                           ["op", "instance", "kind", "name", "type"],
                           ["op", "instance", "kind", "name", "type", "delay"],
+                          ["op", "instance", "kind", "name", "type", "declared"],
+                          ["op", "instance", "kind", "name", "type", "declared", "delay"],
                       ), (path, keys)
+                  if instruction["op"] == "define_type":
+                      assert keys[:3] == ["op", "name", "type"], (path, keys)
+                      assert set(keys[3:]) <= {"title", "description"}, (path, keys)
                   if instruction["op"] == "declare_instance":
                       assert keys == ["op", "name", "parent", "team"], (path, keys)
                   if instruction["op"] == "declare_timer":

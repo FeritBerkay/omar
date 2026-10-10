@@ -838,6 +838,7 @@ mod tests {
                     PortState {
                         kind: PortKind::Input,
                         ty: "string".to_string(),
+                        declared: None,
                         delay: None,
                         instance: String::new(),
                     },
@@ -847,6 +848,7 @@ mod tests {
                     PortState {
                         kind: PortKind::Output,
                         ty: "string".to_string(),
+                        declared: None,
                         delay: None,
                         instance: String::new(),
                     },
@@ -879,6 +881,7 @@ mod tests {
         let member = |instance: &str, kind, ty: &str| PortState {
             kind,
             ty: ty.to_string(),
+            declared: None,
             delay: None,
             instance: instance.to_string(),
         };

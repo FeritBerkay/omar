@@ -430,6 +430,13 @@ def testExternalSchemas : IO Unit := do
       "list<option<string in [\"approved\",\"needs_revision\"]>>"] do
     assertEqual "schema type emitted"
       (instructions.any (fun item => (item.getObjValAs? String "type").toOption == some expected)) true
+  -- The spelling travels beside the expanded type, and only where a name was used.
+  for expected in ["Decision", "list<option<Decision>>"] do
+    assertEqual s!"declared spelling {expected}"
+      (instructions.any (fun item => (item.getObjValAs? String "declared").toOption == some expected)) true
+  assertEqual "a built-in type has no declared spelling"
+    (instructions.any (fun item => (item.getObjValAs? String "type").toOption == some "string" &&
+      (item.getObjValAs? String "declared").toOption.isSome)) false
   assertEqual "schema name does not rewrite agent"
     (instructions.any (fun item => (item.getObjValAs? String "name").toOption == some "review.Decision")) true
   for invalid in [
@@ -461,21 +468,38 @@ def testExternalSchemas : IO Unit := do
   | .error error => throw (IO.userError s!"escaped schema values: {error}")
   -- A body may read an enum port: what arrives was checked when it was
   -- written. It may not write one: its Rust String admits anything.
+  let readsEnum := "input token : Decision output out : string reaction(token) -> out {= out = token; =}"
+  match compileSourceWithSchemas "CodeEnum"
+      ("type Decision from \"schemas/decision.json\" team T { " ++ readsEnum ++ " } main { t = T() }")
+      #[ ("schemas/decision.json", schema) ] with
+  | .ok _ => pure ()
+  | .error error => throw (IO.userError s!"enum trigger blocked code reaction: {error}")
+  let writesEnum := "input token : string output out : Decision reaction(token) -> out {= out = token; =}"
+  match compileSourceWithSchemas "CodeEnum"
+      ("type Decision from \"schemas/decision.json\" team T { " ++ writesEnum ++ " } main { t = T() }")
+      #[ ("schemas/decision.json", schema) ] with
+  | .error error =>
+    assertEqual "code enum effect rejected during compilation" (decide ((error.splitOn "cannot write enum port").length > 1)) true
+  | .ok _ => throw (IO.userError "accepted enum port as code reaction effect")
+  -- A body carries scalars only, so a wrapped port is out of its reach whether
+  -- or not it is an enum -- and the compiler says so, not the verifier.
   for declarations in [
-      "input token : Decision output out : string reaction(token) -> out {= out = token; =}",
-      "input token : list<Decision> output out : string reaction(token) -> out {= out = None; =}"] do
-    let coded := "type Decision from \"schemas/decision.json\" team T { " ++ declarations ++ " } main { t = T() }"
-    match compileSourceWithSchemas "CodeEnum" coded #[ ("schemas/decision.json", schema) ] with
-    | .ok _ => pure ()
-    | .error error => throw (IO.userError s!"enum trigger blocked code reaction: {error}")
-  for declarations in [
-      "input token : string output out : Decision reaction(token) -> out {= out = token; =}",
-      "input token : string output out : option<Decision> reaction(token) -> out {= out = None; =}"] do
+      "input token : list<Decision> output out : string reaction(token) -> out {= out = None; =}",
+      "input token : string output out : option<Decision> reaction(token) -> out {= out = None; =}",
+      "input token : list<string> output out : string reaction(token) -> out {= out = None; =}"] do
     let coded := "type Decision from \"schemas/decision.json\" team T { " ++ declarations ++ " } main { t = T() }"
     match compileSourceWithSchemas "CodeEnum" coded #[ ("schemas/decision.json", schema) ] with
     | .error error =>
-      assertEqual "code enum effect rejected during compilation" (decide ((error.splitOn "cannot write enum port").length > 1)) true
-    | .ok _ => throw (IO.userError "accepted enum port as code reaction effect")
+      assertEqual "wrapped port rejected for code reaction" (decide ((error.splitOn "cannot use port").length > 1)) true
+    | .ok _ => throw (IO.userError s!"accepted wrapped port in code reaction: {declarations}")
+  -- The runtime holds state and parameters in built-in types only.
+  for (source, what) in [
+      ("type Decision from \"s.json\" team T { state last : Decision = \"approved\" } main { t = T() }", "state"),
+      ("type Decision from \"s.json\" team T(default : Decision) { input token : string } main { t = T(\"approved\") }", "parameter")] do
+    match compileSourceWithSchemas "Scalar" source #[ ("s.json", schema) ] with
+    | .error error =>
+      assertEqual s!"schema type rejected for {what}" (decide ((error.splitOn s!"{what} ").length > 1 && (error.splitOn "cannot have schema type").length > 1)) true
+    | .ok _ => throw (IO.userError s!"accepted schema type for {what}")
   -- The name and what the schema said about it reach the bytecode, so the
   -- agent can be told `Decision` rather than the refinement spelled out.
   let described := "{\"type\":\"string\",\"enum\":[\"approved\",\"needs_revision\"]," ++

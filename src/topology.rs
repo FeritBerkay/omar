@@ -53,6 +53,10 @@ pub enum Instruction {
         kind: PortKind,
         #[serde(rename = "type")]
         ty: String,
+        /// The type as the program spelled it, when that names an imported
+        /// type: `list<Decision>` where `ty` is the expanded refinement.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        declared: Option<String>,
         #[serde(default)]
         delay: Option<u64>,
         #[serde(default)]
@@ -158,6 +162,11 @@ pub struct PortState {
     pub kind: PortKind,
     #[serde(rename = "type")]
     pub ty: String,
+    /// How the program spelled the type, when that differs from `ty`: the
+    /// name of an imported type, possibly inside `list` or `option`. The VM
+    /// checks `ty`; the agent is told this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delay: Option<u64>,
     #[serde(default)]
@@ -549,6 +558,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 name,
                 kind,
                 ty,
+                declared,
                 delay,
                 instance,
             } => {
@@ -557,7 +567,20 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 if ty.trim().is_empty() {
                     bail!("port '{name}' has an empty type");
                 }
-                check_refinement(name, ty)?;
+                check_type("port", name, ty)?;
+                // The spelling is shown to the agent in place of the type, so
+                // it has to be the type: every name in it a type this plan
+                // defined, expanding to exactly `ty`.
+                if let Some(declared) = declared {
+                    let definitions: BTreeMap<String, String> = state
+                        .types
+                        .iter()
+                        .map(|(name, defined)| (name.clone(), defined.ty.clone()))
+                        .collect();
+                    if rename_type(declared, &definitions) != *ty {
+                        bail!("port '{name}' is declared as '{declared}', which is not {ty}");
+                    }
+                }
                 if delay.is_some() && *kind != PortKind::Action {
                     bail!("only action ports may declare a fixed delay");
                 }
@@ -568,6 +591,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                         PortState {
                             kind: *kind,
                             ty: ty.clone(),
+                            declared: declared.clone(),
                             delay: *delay,
                             instance: instance.clone(),
                         },
@@ -587,7 +611,7 @@ pub fn verify(bytecode: &Bytecode) -> Result<VmState> {
                 if ty.trim().is_empty() {
                     bail!("type '{name}' has an empty definition");
                 }
-                check_refinement(name, ty)?;
+                check_type("type", name, ty)?;
                 if state
                     .types
                     .insert(
@@ -1490,12 +1514,17 @@ pub(crate) fn string_enum(ty: &str) -> Option<Vec<String>> {
 
 /// Whether `ty` is, or wraps, a refined string.
 fn is_refined(ty: &str) -> bool {
+    leaf_type(ty).starts_with("string in ")
+}
+
+/// `ty` with its `list` and `option` wrappers taken off.
+fn leaf_type(ty: &str) -> &str {
     for outer in ["list", "option"] {
         if let Some(inner) = generic_inner(ty, outer) {
-            return is_refined(inner);
+            return leaf_type(inner);
         }
     }
-    ty.starts_with("string in ")
+    ty
 }
 
 /// `ty` with each leaf that `names` maps replaced, `list` and `option`
@@ -1563,29 +1592,34 @@ fn validate_value(ty: &str, value: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Reject a refinement that does not parse, wherever it sits in the type.
+/// Reject a type the VM cannot check a value against, wherever the fault sits.
 ///
-/// A refinement that is not well formed is a broken port, not a plain `string`.
-/// Saying so once, here, keeps `string_enum` free to answer "not refined"
-/// everywhere downstream. `validate_value` looks inside `list` and `option`, so
-/// this has to as well, or a nested one would reach the agent and be reported
-/// against the value it wrote rather than against the port.
-fn check_refinement(name: &str, ty: &str) -> Result<()> {
+/// `validate_value` looks inside `list` and `option`, so this has to as well,
+/// or a nested fault would reach the agent and be reported against the value
+/// it wrote rather than against the port. A refinement that does not parse is
+/// a broken port, not a plain `string`; saying so once, here, keeps
+/// `string_enum` free to answer "not refined" everywhere downstream. And what
+/// the wrappers come off to has to be a type the VM knows: `list<string>>` is
+/// a list of nothing it can check.
+fn check_type(what: &str, name: &str, ty: &str) -> Result<()> {
     for outer in ["list", "option"] {
         if ty.starts_with(&format!("{outer}<")) {
             let Some(inner) = generic_inner(ty, outer) else {
-                bail!("port '{name}' has an invalid type '{ty}'");
+                bail!("{what} '{name}' has an invalid type '{ty}'");
             };
-            return check_refinement(name, inner);
+            return check_type(what, name, inner);
         }
     }
-    let Some(list) = ty.strip_prefix("string in ") else {
-        return Ok(());
-    };
-    match serde_json::from_str::<Vec<String>>(list) {
-        Ok(values) if !values.is_empty() => Ok(()),
-        Ok(_) => bail!("port '{name}' admits no value"),
-        Err(error) => bail!("port '{name}' has an invalid string refinement: {error}"),
+    if let Some(list) = ty.strip_prefix("string in ") {
+        return match serde_json::from_str::<Vec<String>>(list) {
+            Ok(values) if !values.is_empty() => Ok(()),
+            Ok(_) => bail!("{what} '{name}' admits no value"),
+            Err(error) => bail!("{what} '{name}' has an invalid string refinement: {error}"),
+        };
+    }
+    match ty {
+        "signal" | "bool" | "int" | "float" | "string" | "path" | "bytes" => Ok(()),
+        _ => bail!("{what} '{name}' has an invalid type '{ty}'"),
     }
 }
 
@@ -1711,9 +1745,12 @@ struct InvocationSpec {
     agent: String,
     trigger_values: BTreeMap<String, Value>,
     allowed_effects: BTreeMap<String, String>,
-    /// The named types the effects are declared with, so the agent is told
-    /// `Decision` and what the schema said about it rather than only the
-    /// refinement spelled out.
+    /// Each effect's type as the program spelled it -- `Decision` where
+    /// `allowed_effects` has the refinement it expands to -- which is what the
+    /// agent is shown.
+    effect_names: BTreeMap<String, String>,
+    /// The named types those spellings use, so the agent is told what the
+    /// schema said about each.
     types: BTreeMap<String, TypeState>,
     /// Its instance's state variables as they stand, which a code body reads
     /// as `self`.
@@ -3113,18 +3150,22 @@ fn invocation_spec(
                 .map(|value| (trigger.clone(), value.clone()))
         })
         .collect();
-    let allowed_effects = reaction
-        .effects
-        .iter()
-        .map(|effect| {
-            let port = state
-                .ports
-                .get(effect)
-                .with_context(|| format!("unknown effect port '{effect}'"))?;
-            Ok((effect.clone(), port.ty.clone()))
-        })
-        .collect::<Result<_>>()?;
-    let types = types_for_effects(state, &allowed_effects);
+    let mut allowed_effects = BTreeMap::new();
+    let mut effect_names = BTreeMap::new();
+    for effect in &reaction.effects {
+        let port = state
+            .ports
+            .get(effect)
+            .with_context(|| format!("unknown effect port '{effect}'"))?;
+        allowed_effects.insert(effect.clone(), port.ty.clone());
+        // As the program spelled it, so the agent reads `Decision` rather
+        // than the refinement it expands to.
+        effect_names.insert(
+            effect.clone(),
+            port.declared.clone().unwrap_or_else(|| port.ty.clone()),
+        );
+    }
+    let types = types_for_effects(state, &effect_names);
     // Only its own instance's: a body reaches state through `self`.
     let state_values = state
         .state_vars
@@ -3138,6 +3179,7 @@ fn invocation_spec(
         agent: reaction.agent.clone(),
         trigger_values,
         allowed_effects,
+        effect_names,
         types,
         state_values,
         contract: reaction.contract.clone(),
@@ -3149,26 +3191,16 @@ fn invocation_spec(
 /// The message an agent is handed, with `rendered` as its prompt.
 ///
 /// The header is one `key: value` per line up to the first blank line, which
-/// is what the stub agent parses. Effects are spelled with the program's type
-/// names, and `types` maps each name back to the type the runtime checks.
+/// is what the stub agent parses. Effects are spelled as the program declared
+/// them, and `types` maps each name used back to the type the runtime checks.
 /// What the schema said about a type follows the header, where the agent
 /// reads it as prose.
 fn invocation_message(invocation: &InvocationSpec, rendered: &str) -> Result<String> {
-    let names: BTreeMap<String, String> = invocation
-        .types
-        .iter()
-        .map(|(name, declared)| (declared.ty.clone(), name.clone()))
-        .collect();
-    let effects: BTreeMap<&String, String> = invocation
-        .allowed_effects
-        .iter()
-        .map(|(port, ty)| (port, rename_type(ty, &names)))
-        .collect();
     let mut header = format!(
         "OMAR INVOCATION\ninvocation_id: {}\ntriggers: {}\neffects: {}\n",
         invocation.id,
         serde_json::to_string(&invocation.trigger_values)?,
-        serde_json::to_string(&effects)?,
+        serde_json::to_string(&invocation.effect_names)?,
     );
     let mut described = String::new();
     if !invocation.types.is_empty() {
@@ -3214,25 +3246,23 @@ fn describe_type(name: &str, declared: &TypeState) -> String {
     line
 }
 
-/// The named types whose definition some effect type is declared with.
+/// The named types the effects' spellings use.
+///
+/// By name, not by what the name expands to: two imports may define the same
+/// values, and the agent is told the one the program wrote.
 fn types_for_effects(
     state: &VmState,
-    allowed_effects: &BTreeMap<String, String>,
+    effect_names: &BTreeMap<String, String>,
 ) -> BTreeMap<String, TypeState> {
-    fn leaf(ty: &str) -> &str {
-        for outer in ["list", "option"] {
-            if let Some(inner) = generic_inner(ty, outer) {
-                return leaf(inner);
-            }
-        }
-        ty
-    }
-    let leaves: BTreeSet<&str> = allowed_effects.values().map(|ty| leaf(ty)).collect();
+    let named: BTreeSet<&str> = effect_names
+        .values()
+        .map(|spelled| leaf_type(spelled))
+        .collect();
     state
         .types
         .iter()
-        .filter(|(_, declared)| leaves.contains(declared.ty.as_str()))
-        .map(|(name, declared)| (name.clone(), declared.clone()))
+        .filter(|(name, _)| named.contains(name.as_str()))
+        .map(|(name, defined)| (name.clone(), defined.clone()))
         .collect()
 }
 
@@ -3507,6 +3537,10 @@ mod tests {
         let plan = verify(&bytecode).unwrap();
         let ty = &plan.ports["review.decision"].ty;
         assert_eq!(ty, r#"string in ["approved","needs_revision"]"#);
+        assert_eq!(
+            plan.ports["review.decision"].declared.as_deref(),
+            Some("Decision")
+        );
         // The name survives to the plan, so the agent can be told it.
         assert_eq!(
             plan.types["Decision"],
@@ -3562,7 +3596,7 @@ mod tests {
                   "description":"Whether to go on"}},
                 {{"op":"define_port","kind":"input","name":"token","type":"string"}},
                 {{"op":"define_port","kind":"{kind}","name":"decision",
-                  "type":"string in [\"continue\",\"stop\"]"}},
+                  "type":"string in [\"continue\",\"stop\"]","declared":"Decision"}},
                 {{"op":"define_port","kind":"output","name":"memo","type":"string"}},
                 {{"op":"install_reaction","id":"reaction.0","agent":"",
                  "triggers":{triggers},"effects":{effects},
@@ -3622,6 +3656,69 @@ mod tests {
     }
 
     #[test]
+    fn a_declared_spelling_has_to_be_the_type() {
+        for (declared, expected) in [
+            ("Verdict", "declared as 'Verdict'"),
+            ("list<Decision>", "declared as 'list<Decision>'"),
+            ("string", "declared as 'string'"),
+        ] {
+            let mut program = body_with_enum("input", r#"["decision"]"#, r#"["memo"]"#);
+            let Instruction::DefinePort {
+                declared: spelled, ..
+            } = &mut program.instructions[3]
+            else {
+                panic!("fixture moved");
+            };
+            *spelled = Some(declared.to_string());
+            let error = verify(&program).unwrap_err().to_string();
+            assert!(error.contains(expected), "{declared} gave {error}");
+        }
+    }
+
+    #[test]
+    fn two_imports_of_the_same_values_keep_their_own_names() {
+        // `A` and `B` expand to one refinement. The agent is told the one the
+        // program wrote on the port, not whichever sorts last.
+        let bytecode: Bytecode = serde_json::from_str(
+            r#"{
+              "version": 1,
+              "team": "Desk",
+              "instructions": [
+                {"op":"begin_plan","team":"Desk"},
+                {"op":"define_type","name":"A","type":"string in [\"x\",\"y\"]","description":"the first"},
+                {"op":"define_type","name":"B","type":"string in [\"x\",\"y\"]","description":"the second"},
+                {"op":"spawn_agent","name":"clerk","backend":"Codex"},
+                {"op":"define_port","kind":"input","name":"topic","type":"string"},
+                {"op":"define_port","kind":"output","name":"out",
+                 "type":"string in [\"x\",\"y\"]","declared":"B"},
+                {"op":"install_reaction","id":"reaction.0","agent":"clerk",
+                 "triggers":["topic"],"effects":["out"],"contract":"out","prompt":"p"},
+                {"op":"commit_plan"}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let plan = verify(&bytecode).unwrap();
+        let reaction = plan.reactions.get_key_value("reaction.0").unwrap();
+        let spec = invocation_spec(
+            &plan,
+            reaction,
+            &BTreeMap::from([("topic".to_string(), json!("t"))]),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(spec.effect_names["out"], "B");
+        assert_eq!(spec.types.keys().collect::<Vec<_>>(), vec!["B"]);
+        let message = invocation_message(&spec, "p").unwrap();
+        assert!(message.contains(r#"effects: {"out":"B"}"#), "{message}");
+        assert!(
+            message.contains("Type B is one of \"x\", \"y\". the second."),
+            "{message}"
+        );
+        assert!(!message.contains("the first"), "{message}");
+    }
+
+    #[test]
     fn an_agent_is_told_the_type_name_and_what_the_schema_said() {
         let decision = TypeState {
             ty: r#"string in ["continue","stop"]"#.into(),
@@ -3636,6 +3733,11 @@ mod tests {
             allowed_effects: BTreeMap::from([
                 ("out".to_string(), decision.ty.clone()),
                 ("all".to_string(), format!("list<{}>", decision.ty)),
+                ("memo".to_string(), "string".to_string()),
+            ]),
+            effect_names: BTreeMap::from([
+                ("out".to_string(), "Decision".to_string()),
+                ("all".to_string(), "list<Decision>".to_string()),
                 ("memo".to_string(), "string".to_string()),
             ]),
             types: BTreeMap::from([("Decision".to_string(), decision.clone())]),
@@ -3675,6 +3777,7 @@ mod tests {
         let plain = InvocationSpec {
             types: BTreeMap::new(),
             allowed_effects: BTreeMap::from([("memo".to_string(), "string".to_string())]),
+            effect_names: BTreeMap::from([("memo".to_string(), "string".to_string())]),
             ..spec
         };
         let message = invocation_message(&plain, "Decide.").unwrap();
@@ -3715,6 +3818,12 @@ mod tests {
             (r#"option<string in ["a"]"#, "invalid type"),
             (r#"list<>"#, "invalid type"),
             (r#"option<>"#, "invalid type"),
+            // One `>` too many leaves `string>`, which is not a type.
+            (r#"list<string>>"#, "invalid type"),
+            (r#"option<int>>"#, "invalid type"),
+            (r#"list<option<int>>>"#, "invalid type"),
+            (r#"list<strin>"#, "invalid type"),
+            (r#"text"#, "invalid type"),
             (r#"list<option<string in [oops>"#, "invalid type"),
             (r#"option<string in []>"#, "admits no value"),
             (
@@ -3923,6 +4032,7 @@ mod tests {
                 PortState {
                     kind,
                     ty: ty.into(),
+                    declared: None,
                     delay: None,
                     instance: String::new(),
                 },
