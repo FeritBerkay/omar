@@ -366,9 +366,12 @@ jobs:
             exit 1
           fi
           echo "$output"
-          grep -Fq '"continue"' <<<"$output"
-          grep -Fq '"stop"' <<<"$output"
-          grep -Fq '"maybe"' <<<"$output"
+          # The refusal names the admitted values and the one it got; the
+          # quotes around them are escaped in the printed error.
+          refusal=$(grep -F 'expected one of' <<<"$output")
+          grep -Fq 'continue' <<<"$refusal"
+          grep -Fq 'stop' <<<"$refusal"
+          grep -Fq 'maybe' <<<"$refusal"
           output=$(cargo run --quiet --bin omar -- run \
             tests/topology/src/SchemaInput.omar --input gate.decision=stop \
             --timeout-seconds 15 --replace --wait)
