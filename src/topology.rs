@@ -274,38 +274,20 @@ pub fn load_bytecode(path: &std::path::Path) -> Result<Bytecode> {
         .with_context(|| format!("invalid bytecode JSON in {}", path.display()))
 }
 
-/// Compile and load an OMAR source program.
+/// Compile and load a program a runtime was sent.
 ///
 /// Installed builds find `omarc` beside the `omar` executable or on `PATH`;
 /// development builds also recognize the compiler built under `lang/.lake`.
-pub fn load_program(path: &Path) -> Result<Bytecode> {
-    load_program_with_compiler(path, None)
-}
-
-fn load_program_with_compiler(path: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
-    load_program_with(path, compiler, Imports::Anywhere)
-}
-
-/// Compile and load a program that was staged from a request.
 ///
-/// The operator did not point the compiler at this file; a client sent its
-/// text, and the daemon wrote it down. What it imports is confined to the
-/// directory it was written in -- the files that came with it -- so a
+/// Every program a runtime compiles arrived as text: a client sent it, with
+/// the files it imports, and the runtime wrote them down together. What the
+/// program imports is confined to the directory it was written in, so a
 /// program sent over the wire cannot read the host's files by naming them.
 pub fn load_staged_program(path: &Path) -> Result<Bytecode> {
-    load_program_with(path, None, Imports::Local)
+    load_program_with(path, None)
 }
 
-/// What a program may import.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Imports {
-    /// Anything the operator can read: they chose the file.
-    Anywhere,
-    /// Relative paths inside the program's own directory only.
-    Local,
-}
-
-fn load_program_with(path: &Path, compiler: Option<&Path>, imports: Imports) -> Result<Bytecode> {
+fn load_program_with(path: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
     if path.extension().and_then(|extension| extension.to_str()) != Some("omar") {
         bail!(
             "OMAR programs must use the .omar extension: {}",
@@ -313,7 +295,81 @@ fn load_program_with(path: &Path, compiler: Option<&Path>, imports: Imports) -> 
         );
     }
 
-    compile_source(path, compiler, imports)
+    compile_source(path, compiler)
+}
+
+/// The schema types a program imports: each `type Name from "path"`, with
+/// the path as the program spells it.
+///
+/// A client reads these from beside the program to send them with it. The
+/// compiler is the authority on the syntax; a declaration this scan misses
+/// is reported by the runtime as an import it was not sent.
+pub fn imports_of(source: &str) -> Vec<(String, String)> {
+    let mut imports = Vec::new();
+    for line in source.lines() {
+        let line = line.split("//").next().unwrap_or_default().trim();
+        let Some(rest) = line.strip_prefix("type") else {
+            continue;
+        };
+        if !rest.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let name_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let (name, rest) = rest.split_at(name_end);
+        let Some(rest) = rest.trim_start().strip_prefix("from") else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        imports.push((name.to_string(), rest[..end].to_string()));
+    }
+    imports
+}
+
+/// Whether an import names a file inside the program's own directory: a
+/// relative path with no `..` component, as `omarc --local-imports` accepts.
+pub fn is_local_import(path: &str) -> bool {
+    use std::path::Component;
+    if path.is_empty() || path.contains('\\') {
+        return false;
+    }
+    let mut named = false;
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(_) => named = true,
+            Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    named
+}
+
+/// The files a program imports, read from beside it and keyed by the path it
+/// imports them under, ready to travel with its text to a runtime.
+///
+/// An import that leaves the program's directory is not read: the runtime
+/// refuses it, and says why.
+pub fn imported_files(program: &Path, source: &str) -> Result<BTreeMap<String, String>> {
+    let directory = program.parent().unwrap_or_else(|| Path::new("."));
+    let mut files = BTreeMap::new();
+    for (name, import) in imports_of(source) {
+        if !is_local_import(&import) {
+            continue;
+        }
+        let text = fs::read_to_string(directory.join(&import)).with_context(|| {
+            format!(
+                "schema type '{name}' imports '{import}', which is not beside {}",
+                program.display()
+            )
+        })?;
+        files.insert(import, text);
+    }
+    Ok(files)
 }
 
 /// Where a program's generated artifacts go.
@@ -339,7 +395,7 @@ pub fn generated_dir(source: &Path) -> PathBuf {
     root.join("src-gen").join(stem)
 }
 
-fn compile_source(source: &Path, compiler: Option<&Path>, imports: Imports) -> Result<Bytecode> {
+fn compile_source(source: &Path, compiler: Option<&Path>) -> Result<Bytecode> {
     let generated = generated_dir(source);
     fs::create_dir_all(&generated)
         .with_context(|| format!("failed to create {}", generated.display()))?;
@@ -396,17 +452,18 @@ fn compile_source(source: &Path, compiler: Option<&Path>, imports: Imports) -> R
         .map(Path::to_path_buf)
         .unwrap_or_else(resolve_omarc);
 
-    let mut command = Command::new(&compiler);
-    if imports == Imports::Local {
-        command.arg("--local-imports");
-    }
-    let output = command.arg(source).arg(&draft).output().with_context(|| {
-        format!(
-            "failed to invoke OMAR compiler '{}'; install omarc beside omar, \
+    let output = Command::new(&compiler)
+        .arg("--local-imports")
+        .arg(source)
+        .arg(&draft)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to invoke OMAR compiler '{}'; install omarc beside omar, \
                  add it to PATH, or set OMARC_BIN",
-            compiler.display()
-        )
-    })?;
+                compiler.display()
+            )
+        })?;
     if !output.status.success() {
         let _ = fs::remove_file(&draft);
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -3525,8 +3582,8 @@ mod tests {
         let bytecode_path = directory.path().join("workflow.json");
         fs::write(&bytecode_path, serde_json::to_vec(&program()).unwrap()).unwrap();
 
-        let error = load_program_with_compiler(&bytecode_path, Some(Path::new("missing-omarc")))
-            .unwrap_err();
+        let error =
+            load_program_with(&bytecode_path, Some(Path::new("missing-omarc"))).unwrap_err();
 
         assert!(error.to_string().contains("must use the .omar extension"));
     }
@@ -3540,12 +3597,17 @@ mod tests {
         let source_path = directory.path().join("workflow.omar");
         fs::write(&source_path, serde_json::to_vec(&program()).unwrap()).unwrap();
         let compiler_path = directory.path().join("omarc");
-        fs::write(&compiler_path, "#!/bin/sh\ncp \"$1\" \"$2\"\n").unwrap();
+        // omarc [options] <input> <output>: the files are the last two arguments.
+        fs::write(
+            &compiler_path,
+            "#!/bin/sh\nshift $(($# - 2))\ncp \"$1\" \"$2\"\n",
+        )
+        .unwrap();
         let mut permissions = fs::metadata(&compiler_path).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&compiler_path, permissions).unwrap();
 
-        let loaded = load_program_with_compiler(&source_path, Some(&compiler_path)).unwrap();
+        let loaded = load_program_with(&source_path, Some(&compiler_path)).unwrap();
 
         assert_eq!(loaded.team, "Demo");
     }
@@ -3578,7 +3640,7 @@ mod tests {
         "#,
         )
         .unwrap();
-        let bytecode = load_program_with_compiler(&source, Some(&compiler)).unwrap();
+        let bytecode = load_program_with(&source, Some(&compiler)).unwrap();
         let plan = verify(&bytecode).unwrap();
         let ty = &plan.ports["review.decision"].ty;
         assert_eq!(ty, r#"string in ["approved","needs_revision"]"#);
@@ -3604,7 +3666,7 @@ mod tests {
         // The bytecode embeds constraints; deployed validation needs no file.
         fs::remove_file(&schema).unwrap();
         validate_value(ty, &json!("needs_revision")).unwrap();
-        let error = load_program_with_compiler(&source, Some(&compiler))
+        let error = load_program_with(&source, Some(&compiler))
             .unwrap_err()
             .to_string();
         assert!(error.contains("decision.json"), "{error}");
@@ -3613,7 +3675,7 @@ mod tests {
             r#"{"type":"string","enum":["approved"],"minLength":20}"#,
         )
         .unwrap();
-        let error = load_program_with_compiler(&source, Some(&compiler))
+        let error = load_program_with(&source, Some(&compiler))
             .unwrap_err()
             .to_string();
         assert!(error.contains("unsupported JSON Schema keyword"), "{error}");
@@ -3651,13 +3713,7 @@ mod tests {
         };
         let source = directory.join("review.omar");
 
-        // The operator's compiler reads what the operator names.
-        fs::write(&source, program(&elsewhere.display().to_string())).unwrap();
-        load_program_with(&source, Some(&compiler), Imports::Anywhere).unwrap();
-        fs::write(&source, program("../decision.json")).unwrap();
-        load_program_with(&source, Some(&compiler), Imports::Anywhere).unwrap();
-
-        // A staged one reads only what came with it.
+        // A staged program reads only what came with it.
         for import in [
             elsewhere.display().to_string(),
             "../decision.json".to_string(),
@@ -3665,7 +3721,7 @@ mod tests {
             "schemas\\decision.json".to_string(),
         ] {
             fs::write(&source, program(&import)).unwrap();
-            let error = load_program_with(&source, Some(&compiler), Imports::Local)
+            let error = load_program_with(&source, Some(&compiler))
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -3675,7 +3731,73 @@ mod tests {
         }
         for import in ["schemas/decision.json", "./schemas/decision.json"] {
             fs::write(&source, program(import)).unwrap();
-            load_program_with(&source, Some(&compiler), Imports::Local).unwrap();
+            load_program_with(&source, Some(&compiler)).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_program_s_imports_are_read_from_beside_it_to_travel_with_it() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("schemas")).unwrap();
+        let decision = r#"{"type":"string","enum":["continue","stop"]}"#;
+        let priority = r#"{"type":"string","enum":["high","low"]}"#;
+        fs::write(directory.path().join("schemas/decision.json"), decision).unwrap();
+        fs::write(directory.path().join("priority.json"), priority).unwrap();
+        let program = directory.path().join("review.omar");
+        let source = r#"
+            // type Commented from "schemas/nowhere.json"
+            type Decision from "./schemas/decision.json" // the route
+            type   Priority   from   "priority.json"
+            type Elsewhere from "/etc/hostname"
+            type Above from "../decision.json"
+            team Review[reviewer : Codex] {
+                input request : string
+                output decision : Decision
+                prompt reviewer(request) -> decision "Review $(request)"
+            }
+            main { review = Review() }
+        "#;
+
+        assert_eq!(
+            imports_of(source),
+            vec![
+                (
+                    "Decision".to_string(),
+                    "./schemas/decision.json".to_string()
+                ),
+                ("Priority".to_string(), "priority.json".to_string()),
+                ("Elsewhere".to_string(), "/etc/hostname".to_string()),
+                ("Above".to_string(), "../decision.json".to_string()),
+            ]
+        );
+        // Imports outside the directory are left for the compiler to refuse.
+        let files = imported_files(&program, source).unwrap();
+        assert_eq!(
+            files,
+            BTreeMap::from([
+                ("./schemas/decision.json".to_string(), decision.to_string()),
+                ("priority.json".to_string(), priority.to_string()),
+            ])
+        );
+
+        let error = imported_files(&program, r#"type Missing from "schemas/missing.json""#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'Missing'"), "{error}");
+        assert!(error.contains("schemas/missing.json"), "{error}");
+        assert!(error.contains("review.omar"), "{error}");
+
+        for local in ["decision.json", "./a/b.json", "a/./b.json"] {
+            assert!(is_local_import(local), "{local}");
+        }
+        for foreign in [
+            "",
+            "/etc/hostname",
+            "../x.json",
+            "a/../../x.json",
+            "a\\b.json",
+        ] {
+            assert!(!is_local_import(foreign), "{foreign}");
         }
     }
 

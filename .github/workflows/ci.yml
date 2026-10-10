@@ -330,7 +330,7 @@ jobs:
         run: |
           output=$(cargo run --quiet --bin omar -- run \
             tests/topology/src/SchemaEnum.omar --input review.request=hello \
-            --timeout-seconds 15 --replace)
+            --timeout-seconds 15 --replace --wait)
           echo "$output"
           grep -Fq 'Output review.decision = "continue"' <<<"$output"
           grep -Fq 'Output review.priority = "high"' <<<"$output"
@@ -345,7 +345,7 @@ jobs:
         run: |
           output=$(cargo run --quiet --bin omar -- run \
             tests/topology/src/SchemaNested.omar --input triage.request=hello \
-            --timeout-seconds 15 --replace)
+            --timeout-seconds 15 --replace --wait)
           echo "$output"
           grep -Fq 'Output triage.decisions = ["continue"]' <<<"$output"
           grep -Fq 'Output triage.priority = null' <<<"$output"
@@ -360,7 +360,7 @@ jobs:
         run: |
           if output=$(cargo run --quiet --bin omar -- run \
               tests/topology/src/SchemaInput.omar --input gate.decision=maybe \
-              --timeout-seconds 15 --replace 2>&1); then
+              --timeout-seconds 15 --replace --wait 2>&1); then
             echo "$output"
             echo "a value outside the enum was accepted"
             exit 1
@@ -371,7 +371,7 @@ jobs:
           grep -Fq '"maybe"' <<<"$output"
           output=$(cargo run --quiet --bin omar -- run \
             tests/topology/src/SchemaInput.omar --input gate.decision=stop \
-            --timeout-seconds 15 --replace)
+            --timeout-seconds 15 --replace --wait)
           echo "$output"
           grep -Fq 'Output gate.route = "routed stop"' <<<"$output"
           grep -Fq 'Output gate.note = "stub"' <<<"$output"

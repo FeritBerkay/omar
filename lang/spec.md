@@ -573,19 +573,21 @@ shadow built-in types or repeat a name. A schema type is for ports: `state` and
 team parameters take built-in types only, because the runtime holds them in
 nothing else, and the compiler rejects a schema type in either position.
 
-A program submitted over the web API is staged on its own, so the files it
-imports have to come with it: `/v1/programs/check` and `/v1/runs` take a
-`files` object mapping each import path to its contents, such as
-`{"schemas/decision.json": "{\"type\":\"string\",\"enum\":[...]}"}`, and stage
-each beside the program. A path must be relative and stay inside the program's
-directory, and may not be the program file itself. A staged program's own
-imports are held to the same rule: `omarc --local-imports` refuses an absolute
-path or one that climbs out of the program's directory, so a program sent over
-the wire reads only what came with it, never the host's files. A program whose
-import is not supplied fails the check with an error naming the missing file.
-Mission Control's editor edits one file and sends no `files` yet, so a program
-typed there cannot import; the client API carries the map for callers that
-have the files.
+A runtime compiles a program from the text it was sent and stages it on its
+own, so the files the program imports have to come with it: `/v1/programs/check`
+and `/v1/runs` take a `files` object mapping each import path to its contents,
+such as `{"schemas/decision.json": "{\"type\":\"string\",\"enum\":[...]}"}`, and
+stage each beside the program. `omar run` fills the map itself, reading each
+`type … from "…"` file from beside the program it was given. A path must be
+relative and stay inside the program's directory, and may not be the program
+file itself. A staged program's own imports are held to the same rule: the
+runtime compiles with `omarc --local-imports`, which refuses an absolute path or
+one that climbs out of the program's directory, so a program sent over the wire
+reads only what came with it, never the host's files. A program whose import is
+not supplied fails the check with an error naming the missing file. Mission
+Control's editor edits one file and sends no `files` yet, so a program typed
+there cannot import; the client API carries the map for callers that have the
+files.
 
 This version supports only a nonempty enum of unique strings. Optional
 `$schema`, `title`, and `description` string metadata is accepted. Other keywords
