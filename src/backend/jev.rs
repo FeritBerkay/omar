@@ -253,16 +253,12 @@ fn evaluate(request: &Value, timeout: Duration) -> std::result::Result<Value, Fa
             }
         }
         if status.is_none() {
-            status = child
-                .try_wait()
+            status = crate::process::child_exited(&child)
                 .map_err(|_| Failure::new("transport", "Could not inspect the HTTP process"))?;
         }
         if let (Some(exit), Some(body)) = (status, body.as_ref()) {
             if written {
-                if exit.code() == Some(28) {
-                    return Err(Failure::new("timeout", "Jev request exceeded its deadline"));
-                }
-                if !exit.success() {
+                if !exit {
                     return Err(Failure::new("transport", "Jev HTTP transport failed"));
                 }
                 return decode_http(body);
@@ -277,10 +273,14 @@ fn evaluate(request: &Value, timeout: Duration) -> std::result::Result<Value, Fa
             libc::kill(-(pid as i32), libc::SIGKILL);
         }
         let _ = child.kill();
-        let _ = child.wait();
     }
+    // The non-reaping observation keeps the PID reserved until cleanup is done.
+    let exit = child.wait();
     let _ = writer.join();
     let _ = reader.join();
+    if exit.ok().and_then(|status| status.code()) == Some(28) {
+        return Err(Failure::new("timeout", "Jev request exceeded its deadline"));
+    }
     transport
 }
 
