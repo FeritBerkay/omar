@@ -300,6 +300,9 @@ jobs:
           echo "$output"
           grep -Fq 'Output run.result = "hello"' <<<"$output"
 
+      - name: Verify registered Jev backend (mock HTTP, no API key)
+        run: python3 tests/ci/jev_backend.py -v
+
       - name: Verify agent invocations use side-channel delivery
         env:
           OMARC_BIN: ${{ github.workspace }}/lang/.lake/build/bin/omarc
