@@ -743,30 +743,32 @@ h2 {
   transition: all 220ms cubic-bezier(0.34, 1.2, 0.64, 1);
 }
 
-.omar-timer-hand.short {
-  stroke: #85838b;
-  stroke-width: 1.3;
-}
-
 .omar-timer-pin {
   fill: #4b4950;
 }
 
-/* Firing sweeps the hands a full turn.
+/* Firing sweeps the hand a full turn: it overshoots the top by a few degrees
+   and settles back upright, the way a real second hand lands.
    This is an event animation, not a claim about elapsed time: logical time
    only moves when the runtime moves it, so a hand creeping round between
-   fires would be inventing a clock the run does not have. */
+   fires would be inventing a clock the run does not have. It plays once per
+   firing because the hand is remounted for each one. */
 @keyframes omar-timer-sweep {
-  from {
+  0% {
     transform: rotate(0deg);
+    animation-timing-function: cubic-bezier(0.45, 0, 0.25, 1);
   }
-  to {
+  78% {
+    transform: rotate(365deg);
+    animation-timing-function: cubic-bezier(0.2, 0.8, 0.4, 1);
+  }
+  100% {
     transform: rotate(360deg);
   }
 }
 
 .omar-timer-group.firing .omar-timer-hands {
-  animation: omar-timer-sweep 700ms cubic-bezier(0.4, 0, 0.2, 1);
+  animation: omar-timer-sweep 950ms both;
   transform-origin: center;
   transform-box: fill-box;
 }
@@ -792,6 +794,15 @@ h2 {
 .omar-timer-meta {
   fill: #85838b;
   font-size: 9.5px;
+}
+
+/* Physical time to the next firing. Purple like a firing face, so it reads as
+   something happening rather than another line of schedule; tabular digits so
+   it does not jitter as it counts. */
+.omar-timer-countdown {
+  fill: #6b56a4;
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -1629,6 +1640,10 @@ h2 {
    drawing is what exists, this is when it happens. */
 .timeline {
   flex: none;
+  /* The diagram keeps most of the column; a preview that outgrows this
+     scrolls within the strip instead of pushing its actions out of view. */
+  max-height: 45%;
+  overflow-y: auto;
   border-top: 1px solid var(--line);
   background: var(--panel-2);
   padding: 10px 14px;
@@ -1676,13 +1691,179 @@ h2 {
   accent-color: var(--purple);
 }
 
+/* The slider, with a tick standing on its track wherever a checkpoint was
+   taken. The ticks overlay the input; each is its own button. */
+.timeline-rail {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  height: 28px;
+}
+
+.timeline-rail input[type="range"] {
+  width: 100%;
+}
+
+.timeline-ticks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  /* Above the slider and its thumb: a tick under the thumb must still take
+     the click. */
+  z-index: 1;
+}
+
+.timeline-controls .timeline-tick {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 12px;
+  margin-left: -1.5px;
+  padding: 0;
+  border: 0;
+  border-radius: 1.5px;
+  background: #4cc37a;
+  font-size: 0;
+  line-height: 0;
+  transform: translateY(-50%);
+  transition: height 120ms ease, width 120ms ease, background 120ms ease;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.timeline-controls .timeline-tick:hover,
+.timeline-controls .timeline-tick:focus-visible {
+  height: 24px;
+  width: 4px;
+  margin-left: -2px;
+  background: #7ef0a6;
+  z-index: 2;
+  outline: none;
+}
+
+.timeline-controls .timeline-tick.resume {
+  box-shadow: 0 0 0 2px var(--panel-2), 0 0 0 3.5px #4cc37a;
+}
+
+.timeline-controls .timeline-tick.selected {
+  height: 24px;
+  width: 4px;
+  margin-left: -2px;
+  background: #7ef0a6;
+  z-index: 1;
+}
+
+.timeline-checkpoints {
+  color: #7ef0a6;
+}
+
+.timeline-run-controls {
+  margin-left: auto;
+  order: 9;
+}
+
+/* Pause, Stop and Resume ride with the strip, folded or not. */
+.run-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 6px;
+}
+
+.run-controls .primary-button,
+.run-controls .secondary-button {
+  height: 26px;
+  padding: 0 10px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.run-controls .secondary-button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.timeline-handle-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+  padding-right: 10px;
+}
+
+.timeline-handle-bar .timeline-handle {
+  border-top: 0;
+  flex: 1;
+}
+
+.timeline-preview {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #2f9e5f;
+  border-radius: 8px;
+  background: rgba(76, 195, 122, 0.06);
+  font-size: 11.5px;
+}
+
+.timeline-preview-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  align-items: baseline;
+  color: var(--text);
+}
+
+.timeline-preview-head span {
+  color: var(--muted);
+}
+
+.timeline-preview-body {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 3px 12px;
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.timeline-preview-body dt {
+  color: var(--text);
+}
+
+.timeline-preview-body dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.timeline-preview-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+
+.timeline-preview-actions .primary-button {
+  height: 28px;
+  padding: 0 12px;
+  font-size: 11.5px;
+}
+
+.timeline-preview-note {
+  color: var(--muted);
+}
+
 .timeline-close {
   font-size: 11px !important;
 }
 
 .timeline-readout {
   display: flex;
-  align-items: baseline;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-top: 8px;
   font-size: 11px;
@@ -2221,6 +2402,15 @@ h2 {
 .deploy-confirmation h2 { margin: 12px 0 20px; font-size: 22px; }
 .deploy-confirmation p { margin: 12px 0; line-height: 1.6; font-size: 14px; }
 .deploy-confirmation-actions { display: flex; justify-content: flex-end; gap: 12px; margin-top: 24px; }
+.deploy-options { margin: 16px 0 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; }
+.deploy-options legend { padding: 0 6px; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.deploy-check { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.deploy-field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); margin-top: 10px; }
+.deploy-field select, .deploy-field input { font: inherit; color: var(--text); background: var(--panel-raised, var(--panel)); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.deploy-period { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.deploy-period input { width: 100%; }
+.deploy-hint { margin: 8px 0 0; font-size: 12px; color: var(--muted); }
+.deploy-invalid { color: var(--danger, #e5484d); }
 
 /* Workspace artifacts are a full-width inspector; editing opens separately. */
 .workspace-file-action { display: flex; justify-content: flex-end; padding: 12px 18px 0; }

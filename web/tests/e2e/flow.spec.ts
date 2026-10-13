@@ -711,6 +711,131 @@ test("the workflow's buttons sit with the workflow", async ({ page }) => {
   expect(stats.x + stats.width).toBeLessThanOrEqual(first.x + 1);
 });
 
+test("a run can be paused and resumed from the panel that shows it", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  // The run's controls live with its timeline, not in the heading: a pause
+  // lands at a tag, a resume continues from one. Before a run, none.
+  const actions = page.getByRole("group", { name: "Run controls" });
+  await expect(actions).toHaveCount(0);
+
+  await deploy(page);
+  const pause = actions.getByRole("button", { name: "Pause" });
+  await expect(pause).toBeEnabled();
+  await pause.click();
+
+  // A pause lands at the next tag boundary, after a checkpoint, so the
+  // button has to say it was heard.
+  await expect(actions.getByRole("button", { name: "Pausing…" })).toBeDisabled();
+  // A stop still outranks it, in case the capture never lands.
+  await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
+
+  // Parked: the picture stays, labelled paused, and what is left to offer is
+  // to continue, or to give the run up (a paused run holds its team).
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+  const resume = actions.getByRole("button", { name: "Resume" });
+  await expect(resume).toBeVisible();
+  await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
+  await expect(actions.getByRole("button", { name: "Pause" })).toHaveCount(0);
+
+  // A reload finds the parked run as it was: its diagram server is gone,
+  // but serve kept the picture, so the controls and the timeline come back.
+  await page.reload();
+  await expect(page.locator(".run-stats")).toContainText("paused", { timeout: 5000 });
+  await expect(actions.getByRole("button", { name: "Resume" })).toBeVisible();
+
+  // A paused run rolls back from the timeline: checkpoints are marks at the
+  // tags they completed, a mark opens a preview of what it holds, and the
+  // preview is where "continue from here" is committed.
+  await page.getByRole("button", { name: "▲ Timeline" }).click();
+  const timeline = page.getByLabel("Logical timeline");
+  // Ticks stand on the track itself, one per checkpoint.
+  await expect(timeline.getByLabel("Checkpoints").getByRole("button")).toHaveCount(2);
+  await timeline.getByRole("button", { name: "Checkpoint #1" }).click();
+  const preview = timeline.getByLabel("Checkpoint preview");
+  await expect(preview).toContainText("Checkpoint #1 · manual");
+  await expect(preview).toContainText("after tag");
+  // What it holds stays in the file viewer; the preview is the tag and the
+  // way back to it, which must be on screen without scrolling the panel.
+  await expect(preview).not.toContainText("workspace");
+  const rollback = preview.getByRole("button", { name: "Roll back to this checkpoint" });
+  await expect(rollback).toBeEnabled();
+  await expect(rollback).toBeInViewport();
+  await rollback.click();
+  // Committed: this checkpoint is now where a resume continues from, and
+  // the newer one is still listed — nothing was deleted.
+  await expect(preview).toContainText("A resume continues from here.");
+  await expect(timeline.getByLabel("Checkpoints").getByRole("button")).toHaveCount(2);
+
+  await resume.click();
+  // Back to a live run, with its controls beside the open timeline.
+  await expect(actions.getByRole("button", { name: "Pause" })).toBeEnabled();
+  await expect(actions.getByRole("button", { name: "Stop" })).toBeEnabled();
+  await expect(actions.getByRole("button", { name: "Resume" })).toHaveCount(0);
+});
+
+test("the confirmation chooses what the run keeps and how it checkpoints", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  // Defaults: files go with the run, and no checkpoints until enabled.
+  const keep = dialog.getByRole("checkbox", { name: "Keep workspace files after the run ends" });
+  await expect(keep).not.toBeChecked();
+  const enable = dialog.getByRole("checkbox", { name: "Enable checkpoints" });
+  await expect(enable).not.toBeChecked();
+  await expect(dialog.getByLabel("Checkpoint cadence")).toHaveCount(0);
+  // Enabled, the cadence starts at every physical hour.
+  await enable.check();
+  const cadence = dialog.getByLabel("Checkpoint cadence");
+  await expect(cadence).toHaveValue("hour");
+  // A custom period that adds up to nothing cannot be confirmed.
+  await cadence.selectOption("custom");
+  await expect(dialog.getByRole("alert")).toContainText("above zero");
+  await expect(dialog.getByRole("button", { name: "Confirm deploy" })).toBeDisabled();
+  await dialog.getByLabel("Checkpoint clock").selectOption("logical");
+  await dialog.getByLabel("Period hours").fill("2");
+  await dialog.getByLabel("Period minutes").fill("30");
+  await expect(dialog.getByRole("alert")).toHaveCount(0);
+  await keep.check();
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  // What the daemon was asked for.
+  const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
+  const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
+  expect(options).toEqual({ keep_workspaces: true, checkpoint_period: "logical:2h30m" });
+});
+
+test("checkpoints are off unless enabled", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  await page.getByRole("button", { name: "Deploy", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: /Deploy/ });
+  await expect(dialog.getByRole("checkbox", { name: "Enable checkpoints" })).not.toBeChecked();
+  await dialog.getByRole("button", { name: "Confirm deploy" }).click();
+  await expect(page.locator(".connection")).toContainText("observing");
+  const runs = await (await page.request.get(`${fake.url}/v1/runs`)).json();
+  const options = await (await page.request.get(`${fake.url}/v1/runs/${runs.runs[0].run_id}/options`)).json();
+  expect(options).toEqual({ keep_workspaces: false, checkpoint_period: "off" });
+});
+
+test("the file viewer shows the current run's instances only", async ({ page }) => {
+  await useFakeServe(page);
+  await draftUntilProposed(page);
+  // Before a run there is nothing of this chat's to show, whatever the EA holds.
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  const viewer = page.getByRole("dialog", { name: "Files & versions" });
+  await expect(viewer).toContainText("No run in this chat yet");
+  await viewer.getByRole("button", { name: "Close files" }).click();
+  await deploy(page);
+  await expect(page.locator(".connection")).toContainText("observing");
+  await page.getByRole("button", { name: "Files & versions" }).click();
+  const instances = viewer.getByLabel("Team workspace");
+  await expect(instances.locator("option")).toHaveCount(1);
+  await expect(instances.locator("option")).toContainText("leader");
+  await expect(viewer.getByRole("navigation", { name: "Workspace files" })).toContainText("notes.txt");
+});
+
 test("a run can be stopped from the panel that shows it", async ({ page }) => {
   // Until now the only way to end a run started from the UI was to leave the
   // UI and type `omar stop` in a terminal.
@@ -719,7 +844,8 @@ test("a run can be stopped from the panel that shows it", async ({ page }) => {
 
   // The eyebrow says which topology is on screen: this one has not run.
   await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("PROPOSED TOPOLOGY");
-  const actions = page.locator(".diagram-heading .workflow-actions");
+  // Stop belongs to the run's timeline, where a stop lands on a tag.
+  const actions = page.getByRole("group", { name: "Run controls" });
   await expect(actions.getByRole("button", { name: "Stop" })).toHaveCount(0);
 
   await deploy(page);
@@ -1707,8 +1833,19 @@ test("a timer is drawn as a clock, not as a port", async ({ page }) => {
   expect(edges).toBeGreaterThan(0);
 
   // The snapshot's tag is the tag it last fired at, so the face reads as
-  // firing rather than idling.
+  // firing rather than idling, and its one hand sweeps a full turn: the hand
+  // is keyed on the firing tag so the sweep plays once per firing.
   await expect(timer).toHaveClass(/firing/);
+  await expect(timer.locator(".omar-timer-hand")).toHaveCount(1);
+  const hands = timer.locator(".omar-timer-hands");
+  await expect(hands).toHaveAttribute("data-fired", /^\d+:\d+$/);
+  expect(await hands.evaluate((node) => getComputedStyle(node).animationName)).toBe("omar-timer-sweep");
+
+  // The run is live, so physical time to the next firing is counted down
+  // under the schedule. This one fires every 10ns, which is long past by the
+  // time anything is drawn, so the reading is that it is due.
+  await expect(page.locator(".diagram-heading .eyebrow")).toHaveText("LIVE TOPOLOGY");
+  await expect(timer.locator(".omar-timer-countdown")).toHaveText("due");
 });
 
 test("a team inside a team is drawn as a box inside a box", async ({ page }) => {

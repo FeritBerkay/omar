@@ -9,7 +9,13 @@ import {
   useRef,
   useState,
 } from "react";
-import { formatDuration, webAgents, type DiagramSnapshot } from "../lib/protocol";
+import {
+  formatCountdown,
+  formatDuration,
+  runClockAt,
+  webAgents,
+  type DiagramSnapshot,
+} from "../lib/protocol";
 
 /**
  * Lingua Franca renders reactors as labelled containers whose ports sit on the
@@ -73,6 +79,13 @@ const ACTION_SIZE = { width: 26, height: 26 };
 const CLOCK_SIZE = { width: 34, height: 34 };
 const PORT_SIZE = { width: 12, height: 12 };
 const TEAM_PADDING = { top: 30, right: 78, bottom: 30, left: 78 };
+/**
+ * Room under a clock for its captions, which hang below the box ELK sees:
+ * name, schedule and, on a live run, the countdown. Reserved whenever the
+ * container holds a timer rather than only while counting, so starting the
+ * run does not move the boxes.
+ */
+const CLOCK_CAPTIONS = 14;
 const CANVAS_MARGIN = 28;
 /** Feedback edges leave and re-enter horizontally before dropping to a lane. */
 /**
@@ -125,6 +138,17 @@ type TimerView = {
   phase: number;
   /** True on the tag it fired at, which is when the face pulses. */
   firing: boolean;
+  /**
+   * The tag it last fired at, as a string: the hand is keyed on it, so each
+   * firing is a fresh hand and its sweep plays again, even when the timer
+   * fires on consecutive tags and the face never stops reading as firing.
+   */
+  firedKey: string;
+  /**
+   * When it fires next, in the run's own time, or null for a one-shot that
+   * has fired and has nothing left to wait for.
+   */
+  next: number | null;
   center: Point;
 };
 
@@ -655,7 +679,7 @@ async function runElk(
           "elk.spacing.portPort": `${PORT_GAP}`,
           "elk.padding": `[top=${TEAM_PADDING.top},left=${
             TEAM_PADDING.left + room("input")
-          },bottom=${TEAM_PADDING.bottom},right=${
+          },bottom=${TEAM_PADDING.bottom + (timers.length > 0 ? CLOCK_CAPTIONS : 0)},right=${
             TEAM_PADDING.right + room("output")
           }]`,
           // In-layer (vertical) spacing only. Kept generous because an action's
@@ -778,6 +802,9 @@ function buildLayout(
       // or spent, so the hand sits at the top rather than creeping round.
       phase: timer.period > 0 ? (since % timer.period) / timer.period : 0,
       firing: fired !== null && fired === now,
+      firedKey: timer.last_tag ? `${timer.last_tag.timestamp}:${timer.last_tag.microstep}` : "",
+      next:
+        fired === null ? timer.offset : timer.period > 0 ? fired + timer.period : null,
       center: {
         x: (box?.x ?? 0) + (box?.width ?? CLOCK_SIZE.width) / 2,
         y: (box?.y ?? 0) + (box?.height ?? CLOCK_SIZE.height) / 2,
@@ -1113,6 +1140,12 @@ export function componentName(id: string): string {
   return separator === -1 ? id : id.slice(separator + 2);
 }
 
+/** `in 1 m 30 s` until the firing, then `due` until the run gets to it. */
+function countdownLabel(remaining: number): string {
+  const left = formatCountdown(remaining);
+  return left === "due" ? left : `in ${left}`;
+}
+
 export function DiagramCanvas({
   snapshot,
   selection = [],
@@ -1147,6 +1180,32 @@ export function DiagramCanvas({
   // A click that panned the canvas is not a click on what sits under it.
   const draggedRef = useRef(false);
   const selected = useMemo(() => new Set(selection), [selection]);
+
+  // A countdown is the one reading on the canvas that moves between tags,
+  // which is exactly when nothing else does: the hand steps with logical time,
+  // but a timer fires on the physical clock, and that is what an operator
+  // waiting for it wants to see. The run's clock is wall time since the
+  // origin the runtime announced (see `runClockAt`). Only a live run has a
+  // clock to read.
+  const counting =
+    snapshot.status === "running" &&
+    snapshot.timers.some((timer) => timer.last_tag === null || timer.period > 0);
+  const tag = snapshot.current_tag;
+  // When this client first saw the current tag: the fallback origin for a
+  // runtime that has not announced its clock. Keyed on the tag alone, so the
+  // events published within it do not restart the reading.
+  const tagKey = `${tag?.timestamp ?? ""}|${tag?.microstep ?? ""}`;
+  const [seen, setSeen] = useState(() => ({ tagKey, at: Date.now() }));
+  const [wall, setWall] = useState(() => Date.now());
+  useEffect(() => {
+    if (!counting) return;
+    const tick = setInterval(() => setWall(Date.now()), 250);
+    return () => clearInterval(tick);
+  }, [counting]);
+  const firstSeen = seen.tagKey === tagKey ? seen.at : wall;
+  if (seen.tagKey !== tagKey) setSeen({ tagKey, at: wall });
+  /** The run's physical clock as this render sees it, in nanoseconds. */
+  const runClock = runClockAt(snapshot, wall, firstSeen);
 
   // Reads the drag flag when the click happens, never during render.
   function handleNodeClick(component: string) {
@@ -1478,8 +1537,8 @@ export function DiagramCanvas({
             <g className="omar-timers">
               {layout.timers.map((timer) => {
                 const radius = CLOCK_SIZE.width / 2;
-                // The long hand sweeps the period; the short one is a fixed
-                // dial mark, so a face still reads as a clock when stopped.
+                // One hand, at how far through its period the timer is; it
+                // points straight up on the tag it fires at.
                 const angle = timer.phase * Math.PI * 2 - Math.PI / 2;
                 const hand = {
                   x: Math.cos(angle) * (radius - 8),
@@ -1495,22 +1554,22 @@ export function DiagramCanvas({
                     transform={`translate(${timer.center.x},${timer.center.y})`}
                   >
                     <circle className="omar-timer-face" r={radius} />
-                    {/* Grouped so the fire animation turns both hands about
-                        the pin rather than each about its own end. */}
-                    <g className="omar-timer-hands">
+                    {/* Keyed on the firing so the sweep replays each time.
+                        The invisible circle gives the group a bounding box
+                        centred on the pin, which is what the sweep turns
+                        about; a lone hand's box would be centred on itself. */}
+                    <g
+                      key={timer.firedKey}
+                      className="omar-timer-hands"
+                      data-fired={timer.firedKey || undefined}
+                    >
+                      <circle r={radius - 8} fill="none" stroke="none" />
                       <line
                         className="omar-timer-hand"
                         x1={0}
                         y1={0}
                         x2={hand.x}
                         y2={hand.y}
-                      />
-                      <line
-                        className="omar-timer-hand short"
-                        x1={0}
-                        y1={0}
-                        x2={0}
-                        y2={-(radius - 12)}
                       />
                     </g>
                     <circle className="omar-timer-pin" r={1.8} />
@@ -1522,6 +1581,18 @@ export function DiagramCanvas({
                         ? `${formatDuration(timer.offset)}, every ${formatDuration(timer.period)}`
                         : `once at ${formatDuration(timer.offset)}`}
                     </text>
+                    {/* Physical time to its next firing, counting down while
+                        the run is live. A spent one-shot has nothing to wait
+                        for and shows none. */}
+                    {counting && timer.next !== null ? (
+                      <text
+                        className="omar-timer-countdown"
+                        y={radius + 32}
+                        textAnchor="middle"
+                      >
+                        {countdownLabel(timer.next - runClock)}
+                      </text>
+                    ) : null}
                   </g>
                 );
               })}
@@ -1672,7 +1743,6 @@ export function DiagramCanvas({
           <svg viewBox="0 0 12 12" aria-hidden="true">
             <circle className="omar-timer-face" cx="6" cy="6" r="5" />
             <line className="omar-timer-hand" x1="6" y1="6" x2="6" y2="2.5" />
-            <line className="omar-timer-hand short" x1="6" y1="6" x2="8.5" y2="6" />
           </svg>
           timer
         </span>
