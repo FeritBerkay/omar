@@ -42,6 +42,8 @@ type ElkSection = {
 
 type ElkEdge = {
   id: string;
+  sources?: string[];
+  targets?: string[];
   sections?: ElkSection[];
 };
 
@@ -552,6 +554,7 @@ async function runElk(
   snapshot: DiagramSnapshot,
   containers: ContainerView[],
   aspectRatio: number | null,
+  unwrapped: ReadonlySet<string> = new Set(),
 ): Promise<ElkNode> {
   const labels = reactionLabels(snapshot);
   const wrapping: Record<string, string> =
@@ -689,7 +692,7 @@ async function runElk(
           "elk.spacing.edgeNode": "22",
           "elk.layered.spacing.edgeNodeBetweenLayers": "22",
           "elk.layered.nodePlacement.strategy": "NETWORK_SIMPLEX",
-          ...wrapping,
+          ...(unwrapped.has(container.id) ? {} : wrapping),
         },
         ports: ports.map((port) => ({
           id: port.id,
@@ -929,7 +932,20 @@ function buildLayout(
 
     const from = anchorBox(edge.source);
     const to = anchorBox(edge.target);
-    if (from && to && to.x + to.width <= from.x + from.width) {
+    // Two kinds of edge have their target left of their source. One ELK had
+    // to reverse to break a cycle, and draws backwards: out of the source's
+    // left, into the target's right. The other joins one wrapped row to the
+    // next, and ELK already draws it forwards: out of the right, down the gap
+    // between the rows, in from the left. Only the first needs the lane; the
+    // second would be dragged under the whole team by it.
+    const first = routed[0];
+    const last = routed[routed.length - 1];
+    const backwards =
+      from &&
+      to &&
+      (first.x < from.x + from.width - AXIS_EPSILON ||
+        last.x > to.x + AXIS_EPSILON);
+    if (from && to && to.x + to.width <= from.x + from.width && backwards) {
       // Stagger lanes so several feedback edges do not sit on top of each other.
       const span = {
         left: to.x - WRAP_STUB,
@@ -1087,6 +1103,16 @@ async function computeGeometry(
     let scale: number;
     try {
       candidate = await runElk(factory, snapshot, declared, aspectRatio);
+      const stranded = strandedPorts(candidate);
+      if (stranded.size > 0) {
+        candidate = await runElk(
+          factory,
+          snapshot,
+          declared,
+          aspectRatio,
+          stranded,
+        );
+      }
       scale = fitScale(buildLayout(snapshot, declared, candidate), size);
     } catch {
       // Wrapping is an optimisation, and ELK throws on some graphs — cyclic
@@ -1099,6 +1125,38 @@ async function computeGeometry(
     }
   }
   return { declared, elk: best };
+}
+
+/**
+ * Containers whose wrap left one of their own ports in a row by itself.
+ *
+ * ELK wraps a container by cutting its layering into rows, and its ports are
+ * layered like anything else: inputs first, outputs last. A cut right before
+ * the outputs puts them in a row of their own, and the edge into one leaves
+ * its reaction, drops a row, runs back across the box and comes forward
+ * again to a port that is drawn on the border anyway. That row buys nothing,
+ * so such a container is laid out unwrapped instead. The tell is an edge
+ * between a container and its own port with a leftward run in it: with the
+ * ports on the outer layers nothing else can send one backwards.
+ */
+function strandedPorts(node: ElkNode, into = new Set<string>()): Set<string> {
+  const own = new Set((node.ports ?? []).map((port) => port.id));
+  const backwards = (section: ElkSection) =>
+    [section.startPoint, ...(section.bendPoints ?? []), section.endPoint].some(
+      (point, index, points) =>
+        index > 0 && point.x < points[index - 1].x - AXIS_EPSILON,
+    );
+  for (const edge of node.edges ?? []) {
+    const touchesOwn = [...(edge.sources ?? []), ...(edge.targets ?? [])].some(
+      (end) => own.has(end),
+    );
+    if (touchesOwn && (edge.sections ?? []).some(backwards)) {
+      into.add(node.id);
+      break;
+    }
+  }
+  for (const child of node.children ?? []) strandedPorts(child, into);
+  return into;
 }
 
 /**
