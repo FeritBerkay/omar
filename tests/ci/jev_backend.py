@@ -95,7 +95,7 @@ class JevBackendTests(unittest.TestCase):
                 env["OMAR_HOME"] = tempfile.mkdtemp(prefix="omar-jev-adapter-test-")
                 message = "test request" + ("x" * 65536 if mode == "blocked_input" else "")
                 result = subprocess.run([str(REPO / "target/debug/omar"), "run", str(temp / "workflow.omar"),
-                    "--input", "review.request=" + message, "--timeout-seconds", "30", "--fast", "--wait"],
+                    "--input", "review.request=" + message, "--timeout-seconds", "30", "--fast", "--fg"],
                     env=env, text=True, capture_output=True, timeout=60)
                 session = re.search(r"Started session ([\w-]+)", result.stderr)
                 if session:
@@ -156,7 +156,7 @@ main JevConfigurationTest { review = Review() }
                 env["OMAR_JEV_ON_ERROR"] = "bad" if mode == "bad_policy" else "defer"
                 if mode == "empty_model": env["OMAR_JEV_MODEL"] = " "
                 result = subprocess.run([str(REPO / "target/debug/omar"), "run", str(temp / "workflow.omar"),
-                    "--input", "review.request=test", "--timeout-seconds", "30", "--fast", "--wait"],
+                    "--input", "review.request=test", "--timeout-seconds", "30", "--fast", "--fg"],
                     env=env, text=True, capture_output=True, timeout=60)
                 session = re.search(r"Started session ([\w-]+)", result.stderr)
                 if session:
@@ -182,7 +182,7 @@ main JevConfigurationTest { review = Review() }
             env["OMARC_BIN"] = str(REPO / "lang/.lake/build/bin/omarc")
             env["OMAR_HOME"] = tempfile.mkdtemp(prefix="omar-jev-example-test-")
             result = subprocess.run([str(REPO / "target/debug/omar"), "run", str(REPO / "examples/jev-review.omar"),
-                "--input", "review.request=test request", "--timeout-seconds", "30", "--fast", "--wait"],
+                "--input", "review.request=test request", "--timeout-seconds", "30", "--fast", "--fg"],
                 env=env, text=True, capture_output=True, timeout=60)
             session = re.search(r"Started session ([\w-]+)", result.stderr)
             if session:

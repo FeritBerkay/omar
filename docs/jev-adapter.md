@@ -87,7 +87,7 @@ fallback team when appropriate for the workflow.
 ```sh
 export TYPESAFE_API_KEY
 export OMAR_JEV_ON_ERROR=defer  # optional; default is fail
-omar run examples/jev-review.omar --input "review.request=Example request" --wait
+omar run examples/jev-review.omar --input "review.request=Example request" --fg
 ```
 
 Generated Rust reaction crates enable serde_json when a body references it. The

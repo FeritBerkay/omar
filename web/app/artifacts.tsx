@@ -24,7 +24,7 @@ function Content({ preview }: { preview: Preview }) {
   return <p>{preview.size.toLocaleString()} bytes · {preview.kind === "large" ? "Too large for the 512 KiB preview limit." : "Binary file."} Open the worktree in the editor to inspect it.</p>;
 }
 
-export function Artifacts({ serveUrl, onClose }: { serveUrl: string; onClose: () => void }) {
+export function Artifacts({ serveUrl, runId, onClose }: { serveUrl: string; runId: string | null; onClose: () => void }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [selected, setSelected] = useState("");
@@ -39,7 +39,8 @@ export function Artifacts({ serveUrl, onClose }: { serveUrl: string; onClose: ()
   const [compare, setCompare] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [loading, setLoading] = useState(true);
+  // Nothing to load without a run; the listing is the run's own.
+  const [loading, setLoading] = useState(Boolean(runId));
   const [revision, setRevision] = useState(0);
   const [notice, setNotice] = useState("");
   const [editorUrl, setEditorUrl] = useState("");
@@ -52,18 +53,29 @@ export function Artifacts({ serveUrl, onClose }: { serveUrl: string; onClose: ()
     return () => { alive.current = false; current?.close(); previous?.focus(); };
   }, []);
   useEffect(() => {
+    // The run's own instances, not every workspace the chat ever had: the
+    // daemon lists a run's current workspaces, the ones its checkpoints keep,
+    // and copies restored from them.
+    if (!runId) return;
     const controller = new AbortController();
-    void request<{workspaces: Workspace[]}>(serveUrl, "", undefined, controller.signal).then((data) => {
-      setWorkspaces(data.workspaces);
-      setSelected((current) => data.workspaces.some((w) => w.id === current) ? current : data.workspaces[0]?.id || "");
-      setLoading(false);
-    }).catch((e) => { if (!controller.signal.aborted) { setError(e.message); setLoading(false); } });
+    void fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/runs/${encodeURIComponent(runId)}/workspaces`, { signal: controller.signal })
+      .then(async (response) => {
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        return data as { workspaces: Workspace[] };
+      })
+      .then((data) => {
+        if (controller.signal.aborted) return;
+        setWorkspaces(data.workspaces);
+        setSelected((current) => data.workspaces.some((w) => w.id === current) ? current : data.workspaces[0]?.id || "");
+        setLoading(false);
+      }).catch((e) => { if (!controller.signal.aborted) { setError(e.message); setLoading(false); } });
     return () => controller.abort();
-  }, [serveUrl, revision]);
+  }, [serveUrl, runId, revision]);
   useEffect(() => {
     if (!selected) return;
     const controller = new AbortController();
-    void request<{snapshots: Snapshot[]}>(serveUrl, `/${selected}`, undefined, controller.signal).then((data) => setSnapshots(data.snapshots))
+    void request<{snapshots: Snapshot[]}>(serveUrl, `/${selected}`, undefined, controller.signal).then((data) => { if (!controller.signal.aborted) setSnapshots(data.snapshots); })
       .catch((e) => { if (!controller.signal.aborted) setError(e.message); });
     return () => controller.abort();
   }, [serveUrl, selected, revision]);
@@ -71,7 +83,7 @@ export function Artifacts({ serveUrl, onClose }: { serveUrl: string; onClose: ()
     if (!selected) return;
     const controller = new AbortController();
     void request<{entries: Entry[]; truncated: boolean}>(serveUrl, `/${selected}/browse`, { path: directory, snapshot: version || null }, controller.signal)
-      .then((data) => { setEntries(data.entries); setTruncated(data.truncated); })
+      .then((data) => { if (!controller.signal.aborted) { setEntries(data.entries); setTruncated(data.truncated); } })
       .catch((e) => { if (!controller.signal.aborted) setError(e.message); });
     return () => controller.abort();
   }, [serveUrl, selected, version, directory, revision]);
@@ -81,7 +93,7 @@ export function Artifacts({ serveUrl, onClose }: { serveUrl: string; onClose: ()
     void Promise.all([
       request<Preview>(serveUrl, `/${selected}/preview`, { path: file, snapshot: version || null }, controller.signal),
       compare && version ? request<Preview>(serveUrl, `/${selected}/preview`, { path: file }, controller.signal) : Promise.resolve(null),
-    ]).then(([saved, current]) => { setPreview(saved); setComparison(current); })
+    ]).then(([saved, current]) => { if (!controller.signal.aborted) { setPreview(saved); setComparison(current); } })
       .catch((e) => { if (!controller.signal.aborted) setError(e.message); });
     return () => controller.abort();
   }, [serveUrl, selected, version, file, compare, revision]);
@@ -113,7 +125,11 @@ export function Artifacts({ serveUrl, onClose }: { serveUrl: string; onClose: ()
     } catch (e) { if (alive.current) setError((e as Error).message); }
     finally { if (alive.current) setBusy(false); }
   }
-  return <dialog ref={dialog} className="artifacts-dialog" aria-labelledby="artifacts-title" onCancel={onClose}>
+  return <dialog ref={dialog} className="artifacts-dialog" aria-labelledby="artifacts-title" onCancel={onClose} onClick={(event) => {
+    if (event.target !== event.currentTarget) return;
+    const bounds = event.currentTarget.getBoundingClientRect();
+    if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) onClose();
+  }}>
     <header><div><span className="eyebrow">TEAM WORKSPACES</span><h2 id="artifacts-title">Files & versions</h2></div><button className="secondary-button" onClick={onClose} aria-label="Close files">Close</button></header>
     <div className="artifact-controls">
       <label>Team instance<select aria-label="Team workspace" disabled={busy} value={selected} onChange={(e) => selectWorkspace(e.target.value)}>
@@ -123,7 +139,7 @@ export function Artifacts({ serveUrl, onClose }: { serveUrl: string; onClose: ()
         <option value="">Current worktree</option>
         {[...snapshots].reverse().map((s) => <option key={s.id} value={s.id}>#{s.sequence} {s.label} · {new Date(s.created_at * 1000).toLocaleString()}</option>)}
       </select></label>
-      <button className="secondary-button" disabled={busy} onClick={() => { setError(""); setRevision((r) => r + 1); }}>Refresh</button>
+      <button className="secondary-button" disabled={busy || loading} onClick={() => { setLoading(true); setError(""); setPreview(null); setComparison(null); setRevision((r) => r + 1); }}>{loading ? "Refreshing…" : "Refresh"}</button>
       {version ? <button className="primary-button" disabled={busy} onClick={() => void restore()}>Restore as new workspace</button>
         : <button className="primary-button" disabled={!selected || busy} onClick={() => void openEditor()}>{busy ? "Starting editor…" : "Open in Web VS Code"}</button>}
     </div>
@@ -131,11 +147,11 @@ export function Artifacts({ serveUrl, onClose }: { serveUrl: string; onClose: ()
     {editorUrl ? <p><a href={editorUrl} target="_blank" rel="noreferrer">Reopen editor ↗</a> · <button className="artifact-link" disabled={busy} onClick={() => { setBusy(true); void request(serveUrl, `/${selected}/editor/stop`, {}).then(() => { if (alive.current) { setEditorUrl(""); setNotice("Editor stopped. Topology state is unchanged."); } }).catch((e) => { if (alive.current) setError(e.message); }).finally(() => { if (alive.current) setBusy(false); }); }}>Stop editor</button></p> : null}
     {error ? <p className="connection-error" role="alert">{error}</p> : null}
     {notice ? <p role="status">{notice}</p> : null}
-    {!selected ? <p>{loading ? "Loading workspaces…" : "No workspaces in this chat yet. Deploy a topology to create one."}</p> : <div className="artifact-body">
-      <nav aria-label="Workspace files">
+    {!selected ? <p>{loading ? "Loading workspaces…" : runId ? "This run has no workspaces left; they went with it when it ended." : "No run in this chat yet. Deploy a topology to create its workspaces."}</p> : <div className="artifact-body">
+      <nav aria-label="Workspace files" aria-busy={loading}>
         <div className="artifact-path">worktree/{directory}</div>
         {directory ? <button onClick={() => { setDirectory(directory.split("/").slice(0, -1).join("/")); setEntries([]); clearFile(); }}>↰ Parent directory</button> : null}
-        {entries.map((entry) => <button key={entry.name} disabled={entry.kind === "symlink" || entry.kind === "special"} title={entry.kind} onClick={() => {
+        {entries.map((entry) => <button key={entry.name} aria-current={(directory ? `${directory}/${entry.name}` : entry.name) === file ? "true" : undefined} disabled={entry.kind === "symlink" || entry.kind === "special"} title={entry.kind} onClick={() => {
           const path = directory ? `${directory}/${entry.name}` : entry.name;
           clearFile();
           if (entry.kind === "directory") { setDirectory(path); setEntries([]); } else setFile(path);

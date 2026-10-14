@@ -61,7 +61,10 @@ def topologyCases : Array TopologyCase := #[
   { file := "SameAgentSerial.omar", team := "SameAgentSerial", agents := 2, ports := 4,
     reactions := 3, instructions := 12 },
   { file := "SuperdenseTime.omar", team := "SuperdenseTime", agents := 3, ports := 6,
-    connections := 1, reactions := 3, instructions := 16 }
+    connections := 1, reactions := 3, instructions := 16 },
+  -- `main WorldNewsEveryTwoMinutes` names the program; a 2min periodic timer.
+  { file := "WorldNews.omar", team := "WorldNewsEveryTwoMinutes", agents := 2, ports := 3,
+    connections := 1, reactions := 2, instructions := 13 }
 ]
 
 def testTopology (test : TopologyCase) : IO Unit := do
@@ -105,6 +108,10 @@ def testTopology (test : TopologyCase) : IO Unit := do
         (mentions (reaction.body.getD "") "$(idx)") false
     assertEqual "body keeps its braces"
       (program.reactions.all (fun r => mentions (r.body.getD "") "out = Some(token + 1)")) true
+  if test.file == "WorldNews.omar" then
+    -- `2min` is two minutes of logical time, in nanoseconds, every tick.
+    assertEqual "timer period"
+      (mentions bytecode "\"name\": \"fetch.tick\", \"offset\": 0, \"period\": 120000000000") true
   if test.file == "RingLeader.omar" then
     -- State is qualified like a port, typed as OMAR's int, and starts at 0.
     let var ← match program.states[0]? with
@@ -222,7 +229,7 @@ def nodeTeam : String :=
   "team Node(idx : int)[agent : Codex] {
      input token : int
      output out : int
-     prompt agent(token) -> out \"node $(idx) got $(token)\"
+     task agent(token) -> out \"node $(idx) got $(token)\"
    }"
 
 /-- One reaction carrying whatever deadline the caller writes. -/
@@ -230,7 +237,7 @@ def deadlineTeam (deadline : String) : String :=
   "team Desk[a : Codex] {
      input req : string
      output res : string
-     prompt a(req) -> res? within(" ++ deadline ++ ") \"do it\"
+     task a(req) -> res? within(" ++ deadline ++ ") \"do it\"
    }
    main { d = Desk() }"
 
@@ -248,7 +255,7 @@ def testWithin : IO Unit := do
     | .error message => throw (IO.userError s!"within {written}: {message}")
   -- No deadline is not a zero deadline: the run-wide timeout still applies.
   let plain := "team Desk[a : Codex] { input req : string output res : string
-                prompt a(req) -> res \"go\" } main { d = Desk() }"
+                task a(req) -> res \"go\" } main { d = Desk() }"
   match lex plain >>= parse "Desk" with
   | .ok program =>
       assertEqual "no deadline" (program.reactions.all (·.within == none)) true
@@ -415,7 +422,7 @@ def testExternalSchemas : IO Unit := do
   let schema := "{\"type\":\"string\",\"enum\":[\"approved\",\"needs_revision\"]}"
   let source := "type Decision from \"schemas/decision.json\"\n" ++
     "team Review[Decision : Codex] { input Decision : Decision " ++
-    "output out : list<option<Decision>> prompt Decision(Decision) -> out \"Review $(Decision)\" } " ++
+    "output out : list<option<Decision>> task Decision(Decision) -> out \"Review $(Decision)\" } " ++
     "main { review = Review() }"
   let bytecode ← match compileSourceWithSchemas "Review" source #[ ("schemas/decision.json", schema) ] with
     | .ok bytecode => pure bytecode
@@ -537,7 +544,7 @@ def testSchemaTypeResolution : IO Unit := do
   let contents := "{\"type\":\"string\",\"enum\":[\"continue\",\"stop\"]}"
   -- A schema and a backend occupy distinct namespaces.
   let collision := "type Codex from \"s.json\"; team T[worker : Codex] { " ++
-    "input token : Codex output out : Codex prompt worker(token) -> out \"Forward\" } main { t = T() }"
+    "input token : Codex output out : Codex task worker(token) -> out \"Forward\" } main { t = T() }"
   match compileSourceWithSchemas "Names" collision #[ ("s.json", contents) ] with
   | .ok _ => pure ()
   | .error error => throw (IO.userError s!"schema/backend collision: {error}")

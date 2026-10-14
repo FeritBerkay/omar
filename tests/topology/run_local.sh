@@ -208,7 +208,7 @@ run_case() {
 
   printf '\n[%s] running with local agents\n' "$name"
   if run_with_timeout "$case_timeout" "$log" "$name" \
-    "$omar" run "$source" --wait --checkpoint --replace \
+    "$omar" run "$source" --fg --replace \
     --timeout-seconds "$invocation_timeout" "$@"; then
     case_passed=$((case_passed + 1))
   else
@@ -336,8 +336,9 @@ run_case SuperdenseTime SuperdenseTime time.fixed_result,time.connected_result \
 # `Heartbeat` and `Bureau` are deliberately absent. `Heartbeat`'s timer has a
 # non-zero period, so the program never finishes and has no completion marker to
 # wait for. `Bureau` is 32 agents across eight sequential stages, and a release
-# gate is not the place to discover whether that fits in a case timeout. Both are
-# compiled and backend-checked like every other source, just never run here.
+# gate is not the place to discover whether that fits in a case timeout.
+# `WorldNews` never finishes either, and fetches from the internet besides. All
+# three are compiled and backend-checked like every other source, never run here.
 
 if ((passed_cases + failed_cases == 0)); then
   printf 'No topology case named %s\n' "$case_filter" >&2

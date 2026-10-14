@@ -63,8 +63,10 @@ def main():
                                   text=True, capture_output=True, timeout=kwargs.get("timeout", 180))
 
         def run(*args):
+            # Everything below reads workspaces back after their run ended,
+            # which only a run asked to keep them allows.
             if args[0] == "run":
-                args = (*args, "--wait")
+                args = (*args, "--fg", "--keep-workspaces")
             result = omar(*args)
             assert result.returncode == 0, f"{args}: {result.stdout}\n{result.stderr}"
             return result.stdout
@@ -107,12 +109,23 @@ out = Some(cwd.display().to_string());
                                             env=env, text=True, capture_output=True, timeout=90, check=True).stdout)
         server = runtime["tmux_server"]
         try:
+            # By default a run's workspaces go with it when it ends: the
+            # record still names them, the directories are gone.
+            gone = omar("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
+                        "--input", "right.tick=1", "--fast", "--fg")
+            assert gone.returncode == 0, gone.stderr
+            assert json.loads(run("workspace", "list")) == [], "a run kept workspaces it was not asked to keep"
+            root_state = Path(runtime["directory"])
+            first = json.loads(next(root_state.glob("**/topologies/Workspaces/deployment.json")).read_text())
+            assert len(first["workspaces"]) == 3 and not first["keep_workspaces"], first
+            assert not any((root_state / "workspaces" / ws).exists() for ws in first["workspaces"].values())
+            # The launches below are the kept run's alone.
+            launches.write_text("")
             run("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
                 "--input", "right.tick=1", "--fast")
             workspaces = json.loads(run("workspace", "list"))
             assert len(workspaces) == 3, workspaces
             by_instance = {w["instance"]: w for w in workspaces}
-            root_state = Path(runtime["directory"])
             paths = {name: root_state / "workspaces" / ws["id"] / "worktree" for name, ws in by_instance.items()}
             for path in paths.values():
                 assert (path / "artifact.bin").read_bytes() == b"\0\xff\r\n"
@@ -207,7 +220,7 @@ out = Some(cwd.display().to_string());
             records[0].write_text(json.dumps(replaced))
             fault(KILL_FAIL=True)
             refused = omar("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
-                           "--input", "right.tick=1", "--replace", "--fast", "--wait", timeout=60)
+                           "--input", "right.tick=1", "--replace", "--fast", "--fg", timeout=60)
             assert refused.returncode != 0 and "cannot replace deployment" in refused.stderr, refused
             assert json.loads(records[0].read_text()) == replaced, "failed cleanup retired the old run"
             fault()
@@ -231,7 +244,7 @@ out = Some(cwd.display().to_string());
             for args in [("kill", "Workspaces"),
                          ("workspace", "snapshot", legacy["workspaces"]["left"]),
                          ("run", str(program), "--input", "left.tick=1", "--input", "left.child.tick=1",
-                          "--input", "right.tick=1", "--replace", "--fast", "--wait")]:
+                          "--input", "right.tick=1", "--replace", "--fast", "--fg")]:
                 refused = omar(*args, timeout=60)
                 assert refused.returncode != 0 and "no recorded tmux server" in refused.stderr, refused
                 assert json.loads(records[0].read_text()) == legacy
@@ -247,7 +260,7 @@ out = Some(cwd.display().to_string());
                 assert [v["label"] for v in versions] == ["Initial workspace"]
                 refused = omar("workspace", "snapshot", workspace_id, timeout=30)
                 assert refused.returncode != 0 and "tmux session state is unknown" in refused.stderr, refused
-            print("PASS: team workspaces, nested ownership, agent launch, Rust cwd/env, snapshots, and CLI restore")
+            print("PASS: workspaces removed with their run unless kept, nested ownership, agent launch, Rust cwd/env, snapshots, and CLI restore")
         except BaseException:
             log = root_state / "logs" / "runtime.log"
             if log.exists():
