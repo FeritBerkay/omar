@@ -181,7 +181,7 @@ main JevConfigurationTest { review = Review() }
             env["PATH"] = f"{temp}:{REPO}/target/debug:{REPO}/lang/.lake/build/bin:{Path.home()}/.cargo/bin:" + env.get("PATH", "")
             env["OMARC_BIN"] = str(REPO / "lang/.lake/build/bin/omarc")
             env["OMAR_HOME"] = tempfile.mkdtemp(prefix="omar-jev-example-test-")
-            result = subprocess.run([str(REPO / "target/debug/omar"), "run", str(REPO / "examples/jev-review.omar"),
+            result = subprocess.run([str(REPO / "target/debug/omar"), "run", str(REPO / "tests/topology/src/JevReview.omar"),
                 "--input", "review.request=test request", "--timeout-seconds", "30", "--fast", "--fg"],
                 env=env, text=True, capture_output=True, timeout=60)
             session = re.search(r"Started session ([\w-]+)", result.stderr)

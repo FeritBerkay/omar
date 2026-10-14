@@ -1,3 +1,11 @@
+// A Jev task answers a Choice through the TypeSafe API: the prompt is the
+// question, the enum output is the set of options, and an optional string
+// output carries JSON evidence. Needs TYPESAFE_API_KEY and curl; OMAR_JEV_MODEL
+// picks the model (default jev-latest) and OMAR_JEV_ON_ERROR=defer makes a
+// failed call publish the defer option instead of stopping the run.
+//
+//   omar run tests/topology/src/JevReview.omar --input "review.request=Example request" --fg
+
 type Decision from "./schemas/jev-decision.json"
 
 team Review[reviewer : Jev]
