@@ -4,7 +4,7 @@
 than launching a coding-agent pane. Jev is registered by name/case like other
 backends, but is topology-only and is not an executive-assistant backend.
 
-Each prompt writes exactly one string-enum port, and optionally one `string`
+Each task writes exactly one string-enum port, and optionally one `string`
 port for JSON evidence. The enum can be imported with `type Decision from ...`.
 The prompt describes the meaning of the options. The adapter currently uses
 option labels as Choice criteria; explicit per-option criteria are future work.
@@ -16,7 +16,7 @@ team Review[reviewer : Jev]
     input request : string
     output out : Decision
     output evidence : string
-    prompt reviewer(request) -> out, evidence
+    task reviewer(request) -> out, evidence
     "Choose continue if the request can proceed; stop if it cannot; defer if unsure."
 }
 main JevReview { review = Review() }

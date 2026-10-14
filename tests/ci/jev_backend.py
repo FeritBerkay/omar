@@ -13,13 +13,13 @@ team Review[reviewer : Jev] {
     input request : string
     output out : Decision
     output evidence : string
-    prompt reviewer(request) -> out, evidence "Choose continue, stop, or defer."
+    task reviewer(request) -> out, evidence "Choose continue, stop, or defer."
 }
 team Followup[worker : Stub] {
     input decision : Decision
     input evidence : string
     output note : string
-    prompt worker(decision, evidence) -> note "Read the checked decision and evidence."
+    task worker(decision, evidence) -> note "Read the checked decision and evidence."
 }
 main JevBackendTest {
     review = Review()
@@ -138,7 +138,7 @@ class JevBackendTests(unittest.TestCase):
 team Review[reviewer : Jev] {
     input request : string
     output out : Decision
-    prompt reviewer(request) -> out "Choose an option."
+    task reviewer(request) -> out "Choose an option."
 }
 main JevConfigurationTest { review = Review() }
 '''
