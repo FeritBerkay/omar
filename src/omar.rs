@@ -115,7 +115,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create a new independent background runtime
+    /// Create a new independent background runtime, or restart a stopped one by name on this build
     Up(sessions::UpOptions),
     /// List independently addressable runtime sessions
     Ls,
@@ -141,13 +141,9 @@ enum Commands {
         #[arg(long, default_value_t = 100)]
         tail: usize,
     },
-    /// Remove a stopped session's record and state
-    Rm {
-        /// Take a running session down first, like `docker rm -f`
-        #[arg(long)]
-        force: bool,
-    },
-    /// Shut down one runtime and its owned workloads
+    /// Remove a session and everything it kept; a running one is killed first
+    Rm,
+    /// Stop one runtime: running workflows pause at their next tag boundary, and the stopped session keeps its state until `rm`, so `up --name` restarts it
     Down {
         #[arg(long)]
         force: bool,
@@ -325,9 +321,6 @@ enum Commands {
         /// Insist on the bundled Mission Control, served from this same address
         #[arg(long)]
         ui: bool,
-        /// Keep the session's state after it stops
-        #[arg(long)]
-        checkpoint: bool,
     },
 }
 
@@ -503,7 +496,7 @@ async fn async_main(mut cli: Cli) -> Result<()> {
             | Commands::Attach { .. }
             | Commands::Logs { .. }
             | Commands::Down { .. }
-            | Commands::Rm { .. }
+            | Commands::Rm
             | Commands::Run(_)
             | Commands::Runs { .. }
             | Commands::Pause { .. }
@@ -712,7 +705,17 @@ const HELP_SECTIONS: &[(&str, &[&str])] = &[
     ),
     (
         "Topologies",
-        &["run", "runs", "status", "stop", "workspace"],
+        &[
+            "run",
+            "runs",
+            "status",
+            "stop",
+            "pause",
+            "resume",
+            "rollback",
+            "checkpoint",
+            "workspace",
+        ],
     ),
     (
         "Executive assistants and agents",
