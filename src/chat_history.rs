@@ -52,6 +52,8 @@ pub struct ConversationSummary {
 pub struct History {
     version: u32,
     pub active_id: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub registered_workflows: BTreeMap<String, serde_json::Value>,
     pub conversations: Vec<Conversation>,
     #[serde(skip)]
     path: PathBuf,
@@ -166,6 +168,7 @@ impl History {
                 let chat = Conversation::new();
                 let history = Self {
                     version: 1,
+                    registered_workflows: BTreeMap::new(),
                     active_id: chat.id.clone(),
                     conversations: vec![chat],
                     path,
@@ -223,12 +226,12 @@ impl History {
             return Ok(self.conversations[index].id.clone());
         }
         let mut next = self.clone();
-        let mut chat = Conversation::new();
-        chat.messaging_key = Some(key.into());
-        chat.title = title.into();
         if let Some(index) = existing {
             next.conversations[index].messaging_key = None;
         }
+        let mut chat = Conversation::new();
+        chat.messaging_key = Some(key.into());
+        chat.title = title.into();
         let id = chat.id.clone();
         next.conversations.push(chat);
         next.save()?;
@@ -249,6 +252,21 @@ impl History {
         );
         next.save()?;
         *self = next;
+        Ok(())
+    }
+
+    pub fn register_workflows(
+        &mut self,
+        entries: BTreeMap<String, serde_json::Value>,
+    ) -> Result<()> {
+        let mut next = self.clone();
+        for (name, entry) in entries {
+            next.registered_workflows.entry(name).or_insert(entry);
+        }
+        if next.registered_workflows != self.registered_workflows {
+            next.save()?;
+            *self = next;
+        }
         Ok(())
     }
 

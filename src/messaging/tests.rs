@@ -835,6 +835,7 @@ async fn web_approval_becomes_listable_and_runnable_without_restarting_the_gatew
         .lock()
         .unwrap()
         .push(runtime::ApprovedWorkflow {
+            description: None,
             name: "web-News-1".into(),
             request: bundle.clone(),
             output_port: String::new(),

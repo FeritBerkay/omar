@@ -79,7 +79,7 @@ impl Config {
                 .to_path_buf();
         }
         config.validate()?;
-        if config.workflows.is_empty() {
+        if config.workflows.is_empty() && !config.command.is_empty() {
             config.request = load_request(
                 &folder,
                 &config.program_path,
@@ -127,7 +127,20 @@ impl Config {
             !self.platform.is_empty() && !self.account_id.is_empty(),
             "Missing messaging identity"
         );
-        if self.workflows.is_empty() {
+        if self.workflows.is_empty()
+            && self.command.is_empty()
+            && self.program_path.is_empty()
+            && self.output_port.is_empty()
+            && self.files.is_empty()
+            && self.inputs.is_empty()
+            && self.raw_inputs.is_empty()
+        {
+            // A connector can use the runtime catalog without seeding local files.
+            ensure!(
+                matches!(self.platform.as_str(), "slack" | "discord"),
+                "Missing workflow configuration"
+            );
+        } else if self.workflows.is_empty() {
             validate_workflow(
                 &self.command,
                 &self.program_path,
@@ -208,7 +221,7 @@ impl Config {
 #[serde(rename_all = "camelCase")]
 pub struct Workflow {
     #[serde(default)]
-    description: String,
+    pub(super) description: String,
     program_path: String,
     output_port: String,
     #[serde(default = "timeout")]

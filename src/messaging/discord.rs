@@ -627,7 +627,8 @@ pub async fn run(mut config: Config) -> Result<()> {
         channels,
         callback_base: api.base.clone(),
     };
-    let gateway = Arc::new(Gateway::new(config, runtime, api));
+    runtime.import_catalog(&config).await?;
+    let gateway = Arc::new(Gateway::new(config, runtime, api).use_runtime_catalog());
     let mut session = Session::default();
     let mut tasks = JoinSet::new();
     let (mut stop, signal) = super::shutdown_signal();

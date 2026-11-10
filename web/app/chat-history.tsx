@@ -5,7 +5,7 @@ import { saveWorkflowName, useWorkflowNames } from "./lib/workflow-names";
 import { WorkflowIcon } from "./workflow-icon";
 import { WorkflowSortMenu, type WorkflowSort } from "./workflow-sort-menu";
 import type { ConversationSummary } from "./lib/protocol";
-import { describeError, fetchConversations, selectConversation } from "./lib/runtime-client";
+import { describeError, fetchConversations, normalizeRuntimeUrl, selectConversation } from "./lib/runtime-client";
 
 const mobileQuery = "(max-width: 900px)";
 function subscribeViewport(onChange: () => void) {
@@ -49,6 +49,7 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
   onSwitchingChange: (switching: boolean) => void;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
+  const [catalog, setCatalog] = useState<{ name: string; description?: string }[]>([]);
   const [chats, setChats] = useState<ConversationSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [switching, setSwitching] = useState(false);
@@ -57,6 +58,21 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
   const [retry, setRetry] = useState(0);
   const [sort, setSort] = useState<WorkflowSort>("recent");
   const names = useWorkflowNames(serveUrl);
+  useEffect(() => {
+    if (readOnly || offline) return;
+    const controller = new AbortController();
+    async function refreshCatalog() {
+      try {
+        const response = await fetch(`${normalizeRuntimeUrl(serveUrl)}/v1/workflows`, { signal: controller.signal });
+        if (response.ok) setCatalog(await response.json());
+      } catch {
+        // The existing runtime status reports connection problems.
+      }
+    }
+    void refreshCatalog();
+    const timer = window.setInterval(refreshCatalog, 5000);
+    return () => { window.clearInterval(timer); controller.abort(); };
+  }, [serveUrl, readOnly, offline, revision]);
   const [editing, setEditing] = useState<string | null>(null);
   const [editedName, setEditedName] = useState("");
   const cancelRename = useRef(false);
@@ -151,6 +167,14 @@ export function ChatHistory({ serveUrl, activeId, mobile, revision, collapsed, r
       {readOnly ? null : <button className="new-workflow" type="button" disabled={loading || switching} onClick={() => void select()}><span className="new-icon"><WorkflowIcon name="plus" size={15} /></span>New workflow</button>}
       <label className="workflow-search"><WorkflowIcon name="search" size={15} /><input aria-label="Search workflows" placeholder="Search workflows…" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
     </div>
+    {!readOnly && catalog.length > 0 ? <details>
+      <summary className="history-label">REGISTERED WORKFLOWS ({catalog.length})</summary>
+      <ul aria-label="Registered workflows">
+        {catalog.filter(({ name }) => name.toLowerCase().includes(query.toLowerCase())).map(({ name, description }) => (
+          <li key={name} className="workflow-row"><span className="workflow-name">{name}</span>{description ? <span className="workflow-description">{description}</span> : null}</li>
+        ))}
+      </ul>
+    </details> : null}
     <div className="history-label"><span>{sort === "recent" ? "RECENT" : sort === "name" ? "NAME" : "STATUS"}</span><WorkflowSortMenu value={sort} onChange={setSort} /></div>
     {error && !offline ? <div className="history-error" role="alert"><span>{error.startsWith("Can't reach") ? "Couldn't load workflows." : error}</span><button type="button" className="link-button" onClick={() => setRetry((current) => current + 1)}>Retry</button></div> : null}
     <ul aria-label="Saved chats" aria-busy={loading || switching} className={offline ? "stale" : undefined}>

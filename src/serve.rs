@@ -1766,6 +1766,7 @@ fn handle_client(mut stream: TcpStream, workspaces: Arc<Workspaces>, access: Acc
         }
         ("GET", "/v1/chats") => (200, workspaces.list()),
         ("GET", "/v1/workflows") => (200, approved_workflows(&workspaces)),
+        ("POST", "/v1/workflows") => register_workflows(&workspaces, &read_body(content_length)?),
         ("POST", "/v1/chats/messaging") => messaging_chat(&workspaces, &read_body(content_length)?),
         ("POST", "/v1/chats") => {
             let _ = read_body(content_length)?;
@@ -2614,7 +2615,7 @@ impl Context_ {
 /// messaging adapters. Names remain stable across connector/runtime restarts.
 fn approved_workflows(workspaces: &Arc<Workspaces>) -> Value {
     let history = workspaces.history.lock().expect("history poisoned");
-    let mut entries = Vec::new();
+    let mut entries: Vec<_> = history.registered_workflows.values().cloned().collect();
     for chat in &history.conversations {
         let Some(ea) = chat.ea_id else {
             continue;
@@ -2625,8 +2626,12 @@ fn approved_workflows(workspaces: &Arc<Workspaces>) -> Value {
         for (team, request) in &chat.approved_workflows {
             let mut request = request.clone();
             request["conversation_id"] = json!(chat.id);
+            let name = format!("web-{team}-{ea}");
+            if history.registered_workflows.contains_key(&name) {
+                continue;
+            }
             entries.push(json!({
-                "name":format!("web-{team}-{ea}"),
+                "name":name,
                 "request":request,
                 "timeoutSeconds":request["timeout_seconds"],
                 "outputPort":""
@@ -2634,6 +2639,47 @@ fn approved_workflows(workspaces: &Arc<Workspaces>) -> Value {
         }
     }
     json!(entries)
+}
+
+fn register_workflows(workspaces: &Arc<Workspaces>, body: &[u8]) -> (u16, Value) {
+    let Ok(entries) = serde_json::from_slice::<Vec<Value>>(body) else {
+        return (400, json!({"error": "Expected workflow entries"}));
+    };
+    let mut registrations = BTreeMap::new();
+    for entry in entries {
+        let Some(name) = entry["name"].as_str().filter(|name| {
+            !name.is_empty()
+                && name.len() <= 100
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                && !name.starts_with("web-")
+        }) else {
+            return (400, json!({"error": "Invalid registered workflow name"}));
+        };
+        let Ok(request) = serde_json::from_value::<StartRunRequest>(entry["request"].clone())
+        else {
+            return (400, json!({"error": "Invalid workflow run request"}));
+        };
+        if request.conversation_id.is_some()
+            || request.program.trim().is_empty()
+            || entry["outputPort"].as_str().is_none()
+            || entry["timeoutSeconds"].as_u64() != Some(request.timeout_seconds)
+            || request.timeout_seconds == 0
+            || registrations.insert(name.to_owned(), entry).is_some()
+        {
+            return (400, json!({"error": "Invalid or duplicate workflow entry"}));
+        }
+    }
+    match workspaces
+        .history
+        .lock()
+        .expect("history poisoned")
+        .register_workflows(registrations)
+    {
+        Ok(()) => (200, json!({"registered": true})),
+        Err(_) => (500, json!({"error": "Could not save workflow catalog"})),
+    }
 }
 
 /// Selection remembers where to open next, without touching another EA.
@@ -5122,6 +5168,36 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("web-News-"));
         assert!(view_refusal("GET", "/v1/workflows").is_some());
+    }
+
+    #[test]
+    fn registered_workflows_are_persisted_and_reimport_keeps_the_saved_bundle() {
+        let server = test_server();
+        let entry = json!({
+            "name": "research",
+            "request": {"program":"saved source","timeout_seconds":90,"files":{"schema.json":"schema"},"inputs":{"run.topic":"news"}},
+            "timeoutSeconds":90,"outputPort":"run.report"
+        });
+        let url = "/v1/workflows";
+        let response = request(
+            server.address(),
+            "POST",
+            url,
+            Some(&json!([entry.clone()]).to_string()),
+        );
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let mut changed = entry.clone();
+        changed["request"]["program"] = json!("different source");
+        assert_eq!(
+            register_workflows(&server.workspaces, &serde_json::to_vec(&[changed]).unwrap()).0,
+            200
+        );
+        assert_eq!(
+            approved_workflows(&server.workspaces),
+            json!([entry.clone()])
+        );
+        let saved = History::load_session(&server.context.omar_dir).unwrap();
+        assert_eq!(saved.registered_workflows["research"], entry);
     }
 
     #[test]

@@ -207,7 +207,8 @@ pub async fn run(mut config: Config) -> Result<()> {
     super::runtime::bind_chat(&mut config).await?;
     let runtime = OmarRuntime::new(config.runtime_url.clone())?;
     runtime.call("/v1/chat", None).await?;
-    let gateway = Arc::new(Gateway::new(config, runtime, api));
+    runtime.import_catalog(&config).await?;
+    let gateway = Arc::new(Gateway::new(config, runtime, api).use_runtime_catalog());
     let (mut stop, signal) = super::shutdown_signal();
     let mut tasks = JoinSet::new();
     let mut delay = 1;

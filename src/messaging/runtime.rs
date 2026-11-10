@@ -25,6 +25,8 @@ pub struct RuntimeError {
 #[serde(rename_all = "camelCase")]
 pub struct ApprovedWorkflow {
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
     pub request: Value,
     pub output_port: String,
     pub timeout_seconds: u64,
@@ -83,10 +85,41 @@ impl OmarRuntime {
             discord_account: None,
         })
     }
-
     pub fn for_discord(mut self, account: String) -> Self {
         self.discord_account = Some(account);
         self
+    }
+
+    pub async fn import_catalog(&self, config: &super::Config) -> Result<()> {
+        let names: Vec<_> = if config.workflows.is_empty() {
+            vec![config.command.as_str()]
+                .into_iter()
+                .filter(|name| !name.is_empty())
+                .collect()
+        } else {
+            config.workflows.keys().map(String::as_str).collect()
+        };
+        let entries: Vec<_> = names
+            .into_iter()
+            .filter_map(|name| {
+                let workflow = config.select(name)?;
+                Some(serde_json::json!({
+                    "name": name,
+                    "description": config.workflows.get(name).map(|w| &w.description),
+                    "request": workflow.request,
+                    "outputPort": workflow.output_port,
+                    "timeoutSeconds": workflow.timeout_seconds,
+                }))
+            })
+            .collect();
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let root = self.base.split("/chats/").next().unwrap_or(&self.base);
+        Self::new(root.to_owned())?
+            .call("/v1/workflows", Some(&serde_json::json!(entries)))
+            .await?;
+        Ok(())
     }
 
     pub async fn call(&self, path: &str, body: Option<&Value>) -> Result<Value> {

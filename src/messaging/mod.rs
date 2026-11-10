@@ -89,6 +89,7 @@ pub struct Gateway<R, M> {
     pub messenger: M,
     state: Mutex<State>,
     dedup_limit: usize,
+    runtime_catalog: bool,
     dedup_ttl: Duration,
 }
 struct Busy<'a>(&'a Mutex<State>);
@@ -105,8 +106,13 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
             messenger,
             state: Mutex::new(State::default()),
             dedup_limit: 2000,
+            runtime_catalog: false,
             dedup_ttl: Duration::from_secs(3600),
         }
+    }
+    fn use_runtime_catalog(mut self) -> Self {
+        self.runtime_catalog = true;
+        self
     }
     async fn reply(&self, destination: &Destination, text: String, run_id: Option<String>) {
         if self
@@ -170,6 +176,7 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
         let configured = message
             .command
             .strip_prefix("run ")
+            .filter(|_| !self.runtime_catalog)
             .and_then(|name| c.select(name));
         // Fetch at command time: a web approval is visible without reconnecting.
         let approved = if message.command == "list"
@@ -198,9 +205,22 @@ impl<R: Runtime, M: Messenger> Gateway<R, M> {
         let response = {
             let mut state = self.state.lock().unwrap();
             if message.command == "list" {
-                let mut listing = c.listing();
+                let mut listing = if self.runtime_catalog {
+                    String::from("Available workflows:")
+                } else {
+                    c.listing()
+                };
                 for workflow in &approved {
-                    if c.select(&workflow.name).is_none() {
+                    if self.runtime_catalog {
+                        listing.push_str(&format!("\n- {}", workflow.name));
+                        if let Some(description) = workflow
+                            .description
+                            .as_deref()
+                            .filter(|text| !text.is_empty())
+                        {
+                            listing.push_str(&format!(" — {description}"));
+                        }
+                    } else if c.select(&workflow.name).is_none() {
                         listing.push_str(&format!(
                             "\n- {} — Approved in Mission Control",
                             workflow.name
