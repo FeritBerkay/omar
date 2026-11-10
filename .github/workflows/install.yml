@@ -61,7 +61,7 @@ jobs:
       # Same redirect the shim reads; no rate-limited API call.
       - name: Latest release
         run: |
-          url=$(curl -fsS -o /dev/null -w '%{redirect_url}' "https://github.com/${{ github.repository }}/releases/latest")
+          url=$(curl -fsS -o /dev/null -w '%{redirect_url}' "https://github.com/omar-os/omar/releases/latest")
           echo "LATEST=${url##*/v}" >> "$GITHUB_ENV"
 
       # Default install dir, so the sudo path runs as for a user. Retry: a
@@ -115,7 +115,7 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Latest release
         run: |
-          url=$(curl -fsS -o /dev/null -w '%{redirect_url}' "https://github.com/${{ github.repository }}/releases/latest")
+          url=$(curl -fsS -o /dev/null -w '%{redirect_url}' "https://github.com/omar-os/omar/releases/latest")
           echo "LATEST=${url##*/v}" >> "$GITHUB_ENV"
       - name: Install (${{ env.SCRIPT }})
         shell: sh -e {0}

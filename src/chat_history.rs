@@ -258,16 +258,27 @@ impl History {
     pub fn register_workflows(
         &mut self,
         entries: BTreeMap<String, serde_json::Value>,
-    ) -> Result<()> {
-        let mut next = self.clone();
-        for (name, entry) in entries {
-            next.registered_workflows.entry(name).or_insert(entry);
+        replace: bool,
+    ) -> Result<Vec<String>> {
+        let conflicts: Vec<_> = entries
+            .iter()
+            .filter(|(name, entry)| {
+                self.registered_workflows
+                    .get(*name)
+                    .is_some_and(|saved| saved != *entry)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if !replace && !conflicts.is_empty() {
+            return Ok(conflicts);
         }
+        let mut next = self.clone();
+        next.registered_workflows.extend(entries);
         if next.registered_workflows != self.registered_workflows {
             next.save()?;
             *self = next;
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
     pub fn approve_workflow(

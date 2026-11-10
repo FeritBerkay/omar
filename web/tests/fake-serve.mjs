@@ -456,6 +456,9 @@ export async function startFakeServe({
       });
     }
     // Operator/EA conversation.
+    if (request.method === "GET" && url.pathname === "/v1/workflows") {
+      return json(response, 200, []);
+    }
     if (request.method === "GET" && url.pathname === "/v1/chats") {
       return json(response, 200, { active_id: activeChat.id, conversations: [...chats.values()].map(chatSummary).sort((a, b) => b.updated_at - a.updated_at) });
     }

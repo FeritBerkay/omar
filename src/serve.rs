@@ -2642,8 +2642,16 @@ fn approved_workflows(workspaces: &Arc<Workspaces>) -> Value {
 }
 
 fn register_workflows(workspaces: &Arc<Workspaces>, body: &[u8]) -> (u16, Value) {
-    let Ok(entries) = serde_json::from_slice::<Vec<Value>>(body) else {
-        return (400, json!({"error": "Expected workflow entries"}));
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Registration {
+        Import(Vec<Value>),
+        Replace { entries: Vec<Value>, replace: bool },
+    }
+    let (entries, replace) = match serde_json::from_slice::<Registration>(body) {
+        Ok(Registration::Import(entries)) => (entries, false),
+        Ok(Registration::Replace { entries, replace }) => (entries, replace),
+        Err(_) => return (400, json!({"error": "Expected workflow entries"})),
     };
     let mut registrations = BTreeMap::new();
     for entry in entries {
@@ -2675,9 +2683,13 @@ fn register_workflows(workspaces: &Arc<Workspaces>, body: &[u8]) -> (u16, Value)
         .history
         .lock()
         .expect("history poisoned")
-        .register_workflows(registrations)
+        .register_workflows(registrations, replace)
     {
-        Ok(()) => (200, json!({"registered": true})),
+        Ok(conflicts) if conflicts.is_empty() => (200, json!({"registered": true})),
+        Ok(conflicts) => (
+            409,
+            json!({"error": "Workflow names already have different saved versions", "conflicts": conflicts}),
+        ),
         Err(_) => (500, json!({"error": "Could not save workflow catalog"})),
     }
 }
@@ -5189,8 +5201,12 @@ mod tests {
         let mut changed = entry.clone();
         changed["request"]["program"] = json!("different source");
         assert_eq!(
-            register_workflows(&server.workspaces, &serde_json::to_vec(&[changed]).unwrap()).0,
-            200
+            register_workflows(
+                &server.workspaces,
+                &serde_json::to_vec(&[changed.clone()]).unwrap()
+            )
+            .0,
+            409
         );
         assert_eq!(
             approved_workflows(&server.workspaces),
@@ -5198,6 +5214,13 @@ mod tests {
         );
         let saved = History::load_session(&server.context.omar_dir).unwrap();
         assert_eq!(saved.registered_workflows["research"], entry);
+        let replace = json!({"entries":[changed.clone()], "replace":true});
+        assert_eq!(
+            register_workflows(&server.workspaces, &serde_json::to_vec(&replace).unwrap()).0,
+            200
+        );
+        let saved = History::load_session(&server.context.omar_dir).unwrap();
+        assert_eq!(saved.registered_workflows["research"], changed);
     }
 
     #[test]

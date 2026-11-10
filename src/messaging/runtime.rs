@@ -118,7 +118,14 @@ impl OmarRuntime {
         let root = self.base.split("/chats/").next().unwrap_or(&self.base);
         Self::new(root.to_owned())?
             .call("/v1/workflows", Some(&serde_json::json!(entries)))
-            .await?;
+            .await
+            .map_err(|error| {
+                if error.downcast_ref::<RuntimeError>().is_some_and(|e| e.status == 409) {
+                    error.context("Workflow catalog import conflicts with a saved entry. Remove the seed config field to use the saved catalog, or explicitly update the runtime entry")
+                } else {
+                    error.context("Could not import the workflow catalog")
+                }
+            })?;
         Ok(())
     }
 
